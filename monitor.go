@@ -127,12 +127,11 @@ func Emit(ctx context.Context, name string, data any, opts ...EmitOption) {
 
 	// Output to stdout (NDJSON)
 	if !cfg.DisableStdout {
-		jsonBytes, err := event.ToJSON()
+		_, err := event.ToJSON()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "monitor: failed to marshal event: %v\n", err)
 			return
 		}
-		fmt.Println(string(jsonBytes))
 	}
 
 	// Send to shipper if configured
