@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
-  GO_VERSION: "1.24"
+  GO_VERSION: "1.25"
 
 jobs:
   lint:
@@ -76,10 +76,9 @@ jobs:
           cache: true
 
       - name: Run govulncheck
-        uses: golang/govulncheck-action@v1
-        with:
-          go-version-input: ${{ env.GO_VERSION }}
-          go-package: ./...
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
 
   release:
     name: Release
