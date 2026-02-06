@@ -171,7 +171,7 @@ func (s *shipper) doFlush() {
 		req.Header.Set("Content-Encoding", contentEncoding)
 	}
 	if s.cfg.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+		req.Header.Set("X-Api-Key", s.cfg.APIKey)
 	}
 
 	resp, err := s.client.Do(req)
