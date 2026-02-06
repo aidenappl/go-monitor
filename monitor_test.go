@@ -90,7 +90,9 @@ func TestGenerateShortID(t *testing.T) {
 
 func TestEvent(t *testing.T) {
 	// Initialize monitor first
-	Init(Config{Service: "test-service", Env: "test", JobID: "test-job"})
+	if err := Init(Config{Service: "test-service", Env: "test", JobID: "test-job"}); err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
 
 	ctx := context.Background()
 	ctx = WithRequestID(ctx, "req-123")
@@ -153,7 +155,9 @@ func TestEvent(t *testing.T) {
 }
 
 func TestEventMissingIDs(t *testing.T) {
-	Init(Config{Service: "test-service", JobID: "global-job"})
+	if err := Init(Config{Service: "test-service", JobID: "global-job"}); err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
 
 	// Event with no IDs in context should have job_id from config only
 	ctx := context.Background()
@@ -175,7 +179,9 @@ func TestEventMissingIDs(t *testing.T) {
 }
 
 func TestEventOmitsEmptyIDs(t *testing.T) {
-	Init(Config{Service: "test-service", JobID: "only-job"})
+	if err := Init(Config{Service: "test-service", JobID: "only-job"}); err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
 
 	ctx := context.Background()
 	event := newEvent(ctx, "test.event", nil, "info")
@@ -205,7 +211,9 @@ func TestEventOmitsEmptyIDs(t *testing.T) {
 }
 
 func TestMiddleware(t *testing.T) {
-	Init(Config{Service: "test-service", JobID: "middleware-test-job"})
+	if err := Init(Config{Service: "test-service", JobID: "middleware-test-job"}); err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
 
 	// Create a test handler that checks context values
 	var gotRequestID, gotTraceID, gotJobID string
@@ -274,7 +282,9 @@ func TestMiddleware(t *testing.T) {
 }
 
 func TestEmitWithLevel(t *testing.T) {
-	Init(Config{Service: "test-service", DisableStdout: true})
+	if err := Init(Config{Service: "test-service", DisableStdout: true}); err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
 
 	ctx := context.Background()
 
@@ -294,7 +304,9 @@ func TestEmitBeforeInit(t *testing.T) {
 }
 
 func TestEventJSONFormat(t *testing.T) {
-	Init(Config{Service: "json-test", Env: "test", JobID: "json-job"})
+	if err := Init(Config{Service: "json-test", Env: "test", JobID: "json-job"}); err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
 
 	ctx := WithRequestID(context.Background(), "json-req")
 	ctx = WithTraceID(ctx, "json-trace")

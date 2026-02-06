@@ -76,10 +76,27 @@ jobs:
           cache: true
 
       - name: Run govulncheck
-        continue-on-error: true # Stdlib vulns require Go upgrade, not code changes
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+          # Run govulncheck - stdlib vulns require Go upgrade, not code changes
+          OUTPUT=$(govulncheck ./... 2>&1) || true
+          echo "$OUTPUT"
+          # Check if only stdlib vulnerabilities (no dependency vulns)
+          if echo "$OUTPUT" | grep -q "from the Go standard library"; then
+            if echo "$OUTPUT" | grep -q "found no other vulnerabilities"; then
+              echo "::notice::Only stdlib vulnerabilities found - requires Go runtime upgrade to fix"
+              exit 0
+            fi
+            # Has both stdlib and dependency vulns
+            echo "::error::Vulnerabilities found in dependencies"
+            exit 1
+          fi
+          # Check for any other vulnerabilities
+          if echo "$OUTPUT" | grep -q "Your code is affected"; then
+            echo "::error::Vulnerabilities found"
+            exit 1
+          fi
+          echo "No vulnerabilities found"
 
   release:
     name: Release

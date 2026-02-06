@@ -182,7 +182,7 @@ func (s *shipper) doFlush() {
 	defer resp.Body.Close()
 
 	// Drain response body to allow connection reuse
-	io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode >= 400 {
 		fmt.Fprintf(os.Stderr, "monitor: ingest returned status %d\n", resp.StatusCode)
