@@ -64,8 +64,13 @@ func TestContextHelpers(t *testing.T) {
 
 func TestGenerateID(t *testing.T) {
 	id := generateID()
-	if len(id) != 32 {
-		t.Errorf("generateID() length = %d, want 32", len(id))
+	// UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars)
+	if len(id) != 36 {
+		t.Errorf("generateID() length = %d, want 36 (UUID format)", len(id))
+	}
+	// Check UUID format with hyphens
+	if id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
+		t.Errorf("generateID() = %v, want UUID format", id)
 	}
 
 	// Should be unique
@@ -77,8 +82,9 @@ func TestGenerateID(t *testing.T) {
 
 func TestGenerateShortID(t *testing.T) {
 	id := generateShortID()
-	if len(id) != 16 {
-		t.Errorf("generateShortID() length = %d, want 16", len(id))
+	// Now uses same UUID format as generateID
+	if len(id) != 36 {
+		t.Errorf("generateShortID() length = %d, want 36 (UUID format)", len(id))
 	}
 
 	// Should be unique
