@@ -15,6 +15,7 @@ type Event struct {
 	JobID     string `json:"job_id,omitempty"`
 	RequestID string `json:"request_id,omitempty"`
 	TraceID   string `json:"trace_id,omitempty"`
+	UserID    string `json:"user_id,omitempty"`
 	Name      string `json:"name"`
 	Level     string `json:"level"`
 	Data      any    `json:"data,omitempty"`
@@ -33,6 +34,7 @@ func newEvent(ctx context.Context, name string, data any, level string) Event {
 
 	requestID := RequestID(ctx)
 	traceID := TraceID(ctx)
+	userID := UserID(ctx)
 
 	service := ""
 	env := ""
@@ -52,6 +54,7 @@ func newEvent(ctx context.Context, name string, data any, level string) Event {
 		JobID:     jobID,
 		RequestID: requestID,
 		TraceID:   traceID,
+		UserID:    userID,
 		Name:      name,
 		Level:     level,
 		Data:      data,

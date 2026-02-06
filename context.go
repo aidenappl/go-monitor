@@ -9,6 +9,7 @@ const (
 	ctxKeyJobID ctxKey = iota
 	ctxKeyRequestID
 	ctxKeyTraceID
+	ctxKeyUserID
 )
 
 // WithJobID returns a new context with the given job ID.
@@ -45,6 +46,19 @@ func RequestID(ctx context.Context) string {
 // TraceID returns the trace ID from the context, or empty string if not set.
 func TraceID(ctx context.Context) string {
 	if v, ok := ctx.Value(ctxKeyTraceID).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// WithUserID returns a new context with the given user ID.
+func WithUserID(ctx context.Context, userID string) context.Context {
+	return context.WithValue(ctx, ctxKeyUserID, userID)
+}
+
+// UserID returns the user ID from the context, or empty string if not set.
+func UserID(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxKeyUserID).(string); ok {
 		return v
 	}
 	return ""

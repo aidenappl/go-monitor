@@ -45,11 +45,15 @@ func TestContextHelpers(t *testing.T) {
 	if got := TraceID(ctx); got != "" {
 		t.Errorf("TraceID(empty ctx) = %v, want empty", got)
 	}
+	if got := UserID(ctx); got != "" {
+		t.Errorf("UserID(empty ctx) = %v, want empty", got)
+	}
 
 	// Test with values
 	ctx = WithJobID(ctx, "job-123")
 	ctx = WithRequestID(ctx, "req-456")
 	ctx = WithTraceID(ctx, "trace-789")
+	ctx = WithUserID(ctx, "user-abc")
 
 	if got := JobID(ctx); got != "job-123" {
 		t.Errorf("JobID() = %v, want job-123", got)
@@ -59,6 +63,9 @@ func TestContextHelpers(t *testing.T) {
 	}
 	if got := TraceID(ctx); got != "trace-789" {
 		t.Errorf("TraceID() = %v, want trace-789", got)
+	}
+	if got := UserID(ctx); got != "user-abc" {
+		t.Errorf("UserID() = %v, want user-abc", got)
 	}
 }
 

@@ -103,13 +103,13 @@ Every event has these fields. At least one of `job_id`, `request_id`, or `trace_
   "timestamp": "2024-01-15T10:30:00.123456789Z",
   "service": "my-service",
   "env": "prod",
-  "job_id": "a1b2c3d4e5f67890",
-  "request_id": "f0e1d2c3b4a59687",
-  "trace_id": "0123456789abcdef0123456789abcdef",
+  "job_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+  "request_id": "f0e1d2c3-b4a5-4968-8c7d-6e5f4a3b2c1d",
+  "trace_id": "01234567-89ab-4cde-8f01-23456789abcd",
+  "user_id": "user-12345",
   "name": "user.created",
   "level": "info",
   "data": {
-    "user_id": 123,
     "email": "user@example.com"
   }
 }
@@ -123,6 +123,7 @@ Every event has these fields. At least one of `job_id`, `request_id`, or `trace_
 | `job_id`     | string | Process-level identifier (optional)     |
 | `request_id` | string | Request-scoped identifier (optional)    |
 | `trace_id`   | string | Distributed trace identifier (optional) |
+| `user_id`    | string | User identifier (optional)              |
 | `name`       | string | Event name (e.g., "user.created")       |
 | `level`      | string | Log level (default: "info")             |
 | `data`       | object | Arbitrary event data                    |
@@ -163,11 +164,13 @@ monitor.Emit(ctx, "error.occurred", data, monitor.WithLevel("error"))
 ctx = monitor.WithJobID(ctx, "job-123")
 ctx = monitor.WithRequestID(ctx, "req-456")
 ctx = monitor.WithTraceID(ctx, "trace-789")
+ctx = monitor.WithUserID(ctx, "user-abc")
 
 // Get IDs from context
 jobID := monitor.JobID(ctx)
 requestID := monitor.RequestID(ctx)
 traceID := monitor.TraceID(ctx)
+userID := monitor.UserID(ctx)
 ```
 
 ### HTTP Middleware
