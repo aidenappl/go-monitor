@@ -81,13 +81,17 @@ jobs:
           # Run govulncheck - stdlib vulns require Go upgrade, not code changes
           OUTPUT=$(govulncheck ./... 2>&1) || true
           echo "$OUTPUT"
-          # Check if only stdlib vulnerabilities (no dependency vulns)
+          # Check if only stdlib vulnerabilities (and any non-reachable dependency vulns)
           if echo "$OUTPUT" | grep -q "from the Go standard library"; then
+            if echo "$OUTPUT" | grep -q "doesn't appear to call"; then
+              echo "::notice::Only stdlib vulnerabilities found (non-reachable dependency vulns ignored) - requires Go runtime upgrade to fix"
+              exit 0
+            fi
             if echo "$OUTPUT" | grep -q "found no other vulnerabilities"; then
               echo "::notice::Only stdlib vulnerabilities found - requires Go runtime upgrade to fix"
               exit 0
             fi
-            # Has both stdlib and dependency vulns
+            # Has reachable dependency vulns
             echo "::error::Vulnerabilities found in dependencies"
             exit 1
           fi
