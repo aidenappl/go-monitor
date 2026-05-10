@@ -16,7 +16,7 @@ func TestMiddlewareWithConfig(t *testing.T) {
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"status":"ok"}`))
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		})
 
 		mw := MiddlewareWithConfig(MiddlewareConfig{})
@@ -111,7 +111,7 @@ func TestMiddlewareWithConfig(t *testing.T) {
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(responseBody))
+			_, _ = w.Write([]byte(responseBody))
 		})
 
 		mw := MiddlewareWithConfig(MiddlewareConfig{
@@ -221,7 +221,7 @@ func TestCaptureResponseWriter(t *testing.T) {
 			maxBodySize:    10,
 		}
 
-		crw.Write([]byte("hello world this is a long body"))
+		_, _ = crw.Write([]byte("hello world this is a long body"))
 
 		if crw.body.Len() != 10 {
 			t.Errorf("body len = %d, want 10", crw.body.Len())

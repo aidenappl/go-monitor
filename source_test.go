@@ -90,7 +90,7 @@ func TestSourceLocationCapture(t *testing.T) {
 		// Verify the data doesn't have source fields
 		jsonBytes, _ := json.Marshal(event)
 		var decoded map[string]any
-		json.Unmarshal(jsonBytes, &decoded)
+		_ = json.Unmarshal(jsonBytes, &decoded)
 
 		dataMap, _ := decoded["data"].(map[string]any)
 		if _, ok := dataMap["source_file"]; ok {
