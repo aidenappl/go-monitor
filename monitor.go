@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -39,6 +42,13 @@ type Config struct {
 
 	// DisableStdout disables printing events to stdout. Default: false.
 	DisableStdout bool
+
+	// Debug enables debug-level events. Default: false.
+	Debug bool
+
+	// CaptureSource enables automatic source location capture. Default: true.
+	// Set to false to disable adding source_file, source_line, source_func to events.
+	CaptureSource *bool
 }
 
 // globalConfig stores the initialized configuration atomically.
@@ -105,14 +115,50 @@ func WithLevel(level string) EmitOption {
 	}
 }
 
+// captureSourceEnabled returns true if source capture is enabled in the config.
+// Defaults to true when CaptureSource is nil (not explicitly set).
+func captureSourceEnabled(cfg *Config) bool {
+	if cfg.CaptureSource == nil {
+		return true
+	}
+	return *cfg.CaptureSource
+}
+
+// attachSourceLocation adds source_file, source_line, source_func to the event's
+// data map using runtime.Caller at the given depth.
+func attachSourceLocation(event *Event, callerDepth int) {
+	pc, file, line, ok := runtime.Caller(callerDepth)
+	if !ok {
+		return
+	}
+
+	funcName := runtime.FuncForPC(pc).Name()
+	// Extract last segment after the final dot (e.g., "monitor.Info" -> "Info")
+	if idx := strings.LastIndex(funcName, "."); idx >= 0 {
+		funcName = funcName[idx+1:]
+	}
+
+	// Merge source fields into data
+	dataMap, ok := event.Data.(map[string]any)
+	if !ok {
+		dataMap = make(map[string]any)
+		if event.Data != nil {
+			dataMap["_data"] = event.Data
+		}
+	}
+	dataMap["source_file"] = filepath.Base(file)
+	dataMap["source_line"] = line
+	dataMap["source_func"] = funcName
+
+	event.Data = dataMap
+}
+
 // Emit emits a monitoring event with the given name and data.
 // The event will always contain: job_id, request_id, trace_id, service, timestamp.
 // If any ID is missing from the context, it will be generated.
 func Emit(ctx context.Context, name string, data any, opts ...EmitOption) {
 	cfg := globalConfig.Load()
 	if cfg == nil {
-		// Silently ignore if not initialized to avoid breaking apps
-		// In debug mode, you might want to log this
 		return
 	}
 
@@ -125,16 +171,43 @@ func Emit(ctx context.Context, name string, data any, opts ...EmitOption) {
 	// Create the event
 	event := newEvent(ctx, name, data, o.level)
 
-	// Output to stdout (NDJSON)
+	// Attach source location if enabled
+	if captureSourceEnabled(cfg) {
+		attachSourceLocation(&event, 2)
+	}
+
+	dispatchEvent(event)
+}
+
+// emitWithCallerDepth is used by convenience functions (Info, Warn, etc.) to emit
+// events with the correct caller depth for source location capture.
+func emitWithCallerDepth(ctx context.Context, name string, data any, level string, callerDepth int) {
+	cfg := globalConfig.Load()
+	if cfg == nil {
+		return
+	}
+
+	event := newEvent(ctx, name, data, level)
+
+	if captureSourceEnabled(cfg) {
+		attachSourceLocation(&event, callerDepth+1)
+	}
+
+	dispatchEvent(event)
+}
+
+// dispatchEvent handles stdout output and shipper send for an event.
+func dispatchEvent(event Event) {
+	cfg := globalConfig.Load()
+	if cfg == nil {
+		return
+	}
 	if !cfg.DisableStdout {
-		_, err := event.ToJSON()
-		if err != nil {
+		if _, err := event.ToJSON(); err != nil {
 			fmt.Fprintf(os.Stderr, "monitor: failed to marshal event: %v\n", err)
 			return
 		}
 	}
-
-	// Send to shipper if configured
 	if s := globalShipper.Load(); s != nil {
 		s.send(event)
 	}

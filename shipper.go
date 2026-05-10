@@ -140,14 +140,15 @@ func (s *shipper) doFlush() {
 		return
 	}
 
-	// Prepare request body (optionally gzipped)
-	var body io.Reader = &buf
-	contentEncoding := ""
+	// Prepare payload bytes for potential retries
+	payload := buf.Bytes()
 
+	// Compress once before the retry loop if gzip is enabled
+	var shipPayload []byte
 	if s.cfg.GzipEnabled {
 		var gzipBuf bytes.Buffer
 		gw := gzip.NewWriter(&gzipBuf)
-		if _, err := gw.Write(buf.Bytes()); err != nil {
+		if _, err := gw.Write(payload); err != nil {
 			fmt.Fprintf(os.Stderr, "monitor: gzip write failed: %v\n", err)
 			return
 		}
@@ -155,36 +156,65 @@ func (s *shipper) doFlush() {
 			fmt.Fprintf(os.Stderr, "monitor: gzip close failed: %v\n", err)
 			return
 		}
-		body = &gzipBuf
-		contentEncoding = "gzip"
+		shipPayload = gzipBuf.Bytes()
+	} else {
+		shipPayload = payload
 	}
 
-	// Send HTTP request
-	req, err := http.NewRequest(http.MethodPost, s.cfg.IngestURL, body)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "monitor: failed to create request: %v\n", err)
-		return
-	}
+	const maxRetries = 3
 
-	req.Header.Set("Content-Type", "application/x-ndjson")
-	if contentEncoding != "" {
-		req.Header.Set("Content-Encoding", contentEncoding)
-	}
-	if s.cfg.APIKey != "" {
-		req.Header.Set("X-Api-Key", s.cfg.APIKey)
-	}
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 1s, 2s, 4s
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+			fmt.Fprintf(os.Stderr, "monitor: retrying flush (attempt %d/%d) after %v\n", attempt, maxRetries, backoff)
+			time.Sleep(backoff)
+		}
 
-	resp, err := s.client.Do(req)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "monitor: failed to ship events: %v\n", err)
-		return
-	}
-	defer resp.Body.Close()
+		req, err := http.NewRequest(http.MethodPost, s.cfg.IngestURL, bytes.NewReader(shipPayload))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "monitor: failed to create request: %v\n", err)
+			return
+		}
 
-	// Drain response body to allow connection reuse
-	_, _ = io.Copy(io.Discard, resp.Body)
+		req.Header.Set("Content-Type", "application/x-ndjson")
+		if s.cfg.GzipEnabled {
+			req.Header.Set("Content-Encoding", "gzip")
+		}
+		if s.cfg.APIKey != "" {
+			req.Header.Set("X-Api-Key", s.cfg.APIKey)
+		}
 
-	if resp.StatusCode >= 400 {
+		resp, err := s.client.Do(req)
+		if err != nil {
+			// Network error — retry
+			fmt.Fprintf(os.Stderr, "monitor: failed to ship events: %v\n", err)
+			if attempt == maxRetries {
+				fmt.Fprintf(os.Stderr, "monitor: dropping batch after %d retries\n", maxRetries)
+				return
+			}
+			continue
+		}
+
+		// Drain response body to allow connection reuse
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode < 400 {
+			return // Success
+		}
+
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			// Client error — don't retry
+			fmt.Fprintf(os.Stderr, "monitor: ingest returned status %d, not retrying\n", resp.StatusCode)
+			return
+		}
+
+		// 5xx — retry
 		fmt.Fprintf(os.Stderr, "monitor: ingest returned status %d\n", resp.StatusCode)
+		if attempt == maxRetries {
+			fmt.Fprintf(os.Stderr, "monitor: dropping batch after %d retries\n", maxRetries)
+			return
+		}
 	}
 }
