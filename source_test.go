@@ -53,6 +53,22 @@ func TestSourceLocationCapture(t *testing.T) {
 		}
 	})
 
+	t.Run("source location with typed nil map data", func(t *testing.T) {
+		ctx := context.Background()
+		var nilMap map[string]any
+		event := newEvent(ctx, "test.typed-nil", nilMap, "info")
+		attachSourceLocation(&event, 1)
+
+		data, ok := event.Data.(map[string]any)
+		if !ok {
+			t.Fatal("event.Data should be a map after source attach")
+		}
+
+		if _, ok := data["source_file"]; !ok {
+			t.Error("data should contain source_file even with typed nil map")
+		}
+	})
+
 	t.Run("source location with non-map data", func(t *testing.T) {
 		ctx := context.Background()
 		event := newEvent(ctx, "test.string-data", "some string", "info")

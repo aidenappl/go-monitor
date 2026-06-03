@@ -140,9 +140,9 @@ func attachSourceLocation(event *Event, callerDepth int) {
 
 	// Merge source fields into data
 	dataMap, ok := event.Data.(map[string]any)
-	if !ok {
+	if !ok || dataMap == nil {
 		dataMap = make(map[string]any)
-		if event.Data != nil {
+		if event.Data != nil && !ok {
 			dataMap["_data"] = event.Data
 		}
 	}
