@@ -115,6 +115,27 @@ func WithLevel(level string) EmitOption {
 	}
 }
 
+// ResolvedEmitOptions is the effective configuration of a single Emit call,
+// after every EmitOption has been applied.
+type ResolvedEmitOptions struct {
+	// Level is the event level, LevelInfo when no option set one.
+	Level string
+}
+
+// ResolveEmitOptions applies opts and reports the settings Emit would use.
+//
+// EmitOption is a function over an unexported struct, so wrappers around this
+// package cannot otherwise inspect what an option did. This exists so they can
+// — most usefully, so a test recorder can assert the level an event was emitted
+// at, not just its name.
+func ResolveEmitOptions(opts ...EmitOption) ResolvedEmitOptions {
+	o := &emitOptions{level: LevelInfo}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return ResolvedEmitOptions{Level: o.level}
+}
+
 // captureSourceEnabled returns true if source capture is enabled in the config.
 // Defaults to true when CaptureSource is nil (not explicitly set).
 func captureSourceEnabled(cfg *Config) bool {
@@ -162,14 +183,11 @@ func Emit(ctx context.Context, name string, data any, opts ...EmitOption) {
 		return
 	}
 
-	// Apply options
-	o := &emitOptions{level: "info"}
-	for _, opt := range opts {
-		opt(o)
-	}
+	// Apply options — shared with ResolveEmitOptions so the two can never drift.
+	o := ResolveEmitOptions(opts...)
 
 	// Create the event
-	event := newEvent(ctx, name, data, o.level)
+	event := newEvent(ctx, name, data, o.Level)
 
 	// Attach source location if enabled
 	if captureSourceEnabled(cfg) {

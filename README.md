@@ -157,6 +157,18 @@ monitor.Emit(ctx, "event.name", map[string]any{"key": "value"})
 monitor.Emit(ctx, "error.occurred", data, monitor.WithLevel("error"))
 ```
 
+#### Inspecting emit options
+
+`EmitOption` is a function over an unexported struct, so wrappers around this
+package cannot see what an option did. `ResolveEmitOptions` applies options and
+reports the settings `Emit` would use — mainly so a wrapper or test recorder can
+assert the **level** an event was emitted at, not just its name.
+
+```go
+opts := monitor.ResolveEmitOptions(monitor.WithLevel(monitor.LevelError))
+opts.Level // "error"  (LevelInfo when no option sets one)
+```
+
 ### Context Helpers
 
 ```go
