@@ -31,15 +31,13 @@ func TestShipperRetry(t *testing.T) {
 
 		s := newShipper(cfg)
 
-		// Add an event and flush
-		s.events = append(s.events, Event{
+		// Ship a batch containing one event
+		s.shipBatch([]Event{{
 			Name:      "test.retry",
 			Service:   "test",
 			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 			Level:     "info",
-		})
-
-		s.doFlush()
+		}})
 
 		got := int(attempts.Load())
 		if got != 3 {
@@ -64,14 +62,12 @@ func TestShipperRetry(t *testing.T) {
 		}
 
 		s := newShipper(cfg)
-		s.events = append(s.events, Event{
+		s.shipBatch([]Event{{
 			Name:      "test.no-retry",
 			Service:   "test",
 			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 			Level:     "info",
-		})
-
-		s.doFlush()
+		}})
 
 		got := int(attempts.Load())
 		if got != 1 {
@@ -96,14 +92,12 @@ func TestShipperRetry(t *testing.T) {
 		}
 
 		s := newShipper(cfg)
-		s.events = append(s.events, Event{
+		s.shipBatch([]Event{{
 			Name:      "test.success",
 			Service:   "test",
 			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 			Level:     "info",
-		})
-
-		s.doFlush()
+		}})
 
 		got := int(attempts.Load())
 		if got != 1 {

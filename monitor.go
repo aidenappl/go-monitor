@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,6 +12,10 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// stdoutWriter is the destination for the stdout branch of dispatchEvent.
+// It defaults to os.Stdout and is only overridden in tests.
+var stdoutWriter io.Writer = os.Stdout
 
 // Config holds the configuration for the monitor.
 type Config struct {
@@ -221,9 +226,14 @@ func dispatchEvent(event Event) {
 		return
 	}
 	if !cfg.DisableStdout {
-		if _, err := event.ToJSON(); err != nil {
+		jsonBytes, err := event.ToJSON()
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "monitor: failed to marshal event: %v\n", err)
 			return
+		}
+		// Write the NDJSON line (payload + trailing newline) in a single Write.
+		if _, err := stdoutWriter.Write(append(jsonBytes, '\n')); err != nil {
+			fmt.Fprintf(os.Stderr, "monitor: failed to write event to stdout: %v\n", err)
 		}
 	}
 	if s := globalShipper.Load(); s != nil {

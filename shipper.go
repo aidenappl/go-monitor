@@ -3,6 +3,7 @@ package monitor
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,40 +13,86 @@ import (
 	"time"
 )
 
+// shutdownFlushTimeout bounds how long stop() waits for the flush worker to
+// ship any queued/in-flight batches before cancelling the shipper context to
+// abort outstanding HTTP work. This keeps Shutdown() from blocking on the full
+// 30s client timeout + retry backoff (see AGENTS.md §9 B4).
+const shutdownFlushTimeout = 5 * time.Second
+
+// flushWork is a unit of work handed from the accumulator goroutine (run) to
+// the dedicated flush worker goroutine (shipLoop) over an ordered channel.
+// A non-nil batch is shipped; a non-nil done channel is closed once all work
+// enqueued before it has been processed (used to implement synchronous flush).
+type flushWork struct {
+	batch []Event
+	done  chan struct{}
+}
+
 // shipper handles async batching and shipping of events to an ingest URL.
+//
+// It runs two goroutines:
+//   - run():      drains eventsCh, accumulates a batch, and hands ready batches
+//     to the flush worker. It never performs network I/O, so it can
+//     keep draining eventsCh even while a flush is retrying.
+//   - shipLoop(): a single worker that consumes batchCh in order and performs
+//     the HTTP POST (with retries). A single worker preserves batch
+//     ordering.
 type shipper struct {
-	cfg      *Config
-	client   *http.Client
-	events   []Event
-	mu       sync.Mutex
-	stopCh   chan struct{}
-	doneCh   chan struct{}
-	flushCh  chan chan struct{}
-	eventsCh chan Event
+	cfg    *Config
+	client *http.Client
+
+	eventsCh   chan Event         // producer → run
+	batchCh    chan flushWork     // run → shipLoop (ordered)
+	flushReqCh chan chan struct{} // synchronous flush requests → run
+	stopCh     chan struct{}      // closed by stop()
+	stopOnce   sync.Once          // guards stopCh close (B5)
+	runDoneCh  chan struct{}      // closed when run() returns
+	flushDone  chan struct{}      // closed when shipLoop() returns
+
+	ctx    context.Context // cancelled on stop to abort in-flight HTTP (B4)
+	cancel context.CancelFunc
 }
 
 // newShipper creates a new shipper with the given config.
 func newShipper(cfg *Config) *shipper {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &shipper{
-		cfg:      cfg,
-		client:   &http.Client{Timeout: 30 * time.Second},
-		events:   make([]Event, 0, cfg.BatchSize),
-		stopCh:   make(chan struct{}),
-		doneCh:   make(chan struct{}),
-		flushCh:  make(chan chan struct{}),
-		eventsCh: make(chan Event, cfg.BatchSize*2),
+		cfg:        cfg,
+		client:     &http.Client{Timeout: 30 * time.Second},
+		eventsCh:   make(chan Event, cfg.BatchSize*2),
+		batchCh:    make(chan flushWork, 8),
+		flushReqCh: make(chan chan struct{}),
+		stopCh:     make(chan struct{}),
+		runDoneCh:  make(chan struct{}),
+		flushDone:  make(chan struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 }
 
-// start begins the shipper's background goroutine.
+// start begins the shipper's background goroutines.
 func (s *shipper) start() {
+	go s.shipLoop()
 	go s.run()
 }
 
-// stop signals the shipper to stop and waits for it to finish.
+// stop signals the shipper to stop, waits for a final bounded drain+flush, and
+// releases resources. Safe to call multiple times (B5).
 func (s *shipper) stop() {
-	close(s.stopCh)
-	<-s.doneCh
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+
+		// Bound the total shutdown wait: if the flush worker hasn't finished
+		// shipping queued batches within the timeout, cancel the context to
+		// abort in-flight/pending HTTP so we don't block ~30-37s (B4).
+		timer := time.AfterFunc(shutdownFlushTimeout, s.cancel)
+
+		<-s.runDoneCh // run() drained eventsCh and closed batchCh
+		<-s.flushDone // shipLoop() shipped everything (or was cancelled)
+
+		timer.Stop()
+		s.cancel()
+	})
 }
 
 // send queues an event for shipping.
@@ -58,72 +105,113 @@ func (s *shipper) send(event Event) {
 	}
 }
 
-// flush synchronously flushes all buffered events.
+// flush synchronously flushes all buffered events, blocking until any batch
+// enqueued before this call has been shipped.
 func (s *shipper) flush() {
 	done := make(chan struct{})
 	select {
-	case s.flushCh <- done:
+	case s.flushReqCh <- done:
 		<-done
 	case <-s.stopCh:
 	}
 }
 
-// run is the main loop for the shipper goroutine.
+// run accumulates events from eventsCh and hands ready batches to the flush
+// worker. It performs no network I/O and therefore keeps draining eventsCh even
+// while the flush worker is retrying (B2).
 func (s *shipper) run() {
-	defer close(s.doneCh)
+	defer close(s.runDoneCh)
 
 	ticker := time.NewTicker(s.cfg.FlushEvery)
 	defer ticker.Stop()
 
+	var events []Event
+
+	// tryHandoff hands the accumulated batch to the flush worker without
+	// blocking. If the flush worker is busy and batchCh is full, the events are
+	// retained and retried on the next opportunity rather than dropped.
+	tryHandoff := func() {
+		if len(events) == 0 {
+			return
+		}
+		select {
+		case s.batchCh <- flushWork{batch: events}:
+			events = nil
+		default:
+			// Flush worker busy; keep accumulating and retry next tick.
+		}
+	}
+
 	for {
 		select {
 		case event := <-s.eventsCh:
-			s.mu.Lock()
-			s.events = append(s.events, event)
-			shouldFlush := len(s.events) >= s.cfg.BatchSize
-			s.mu.Unlock()
-
-			if shouldFlush {
-				s.doFlush()
+			events = append(events, event)
+			if len(events) >= s.cfg.BatchSize {
+				tryHandoff()
 			}
 
 		case <-ticker.C:
-			s.doFlush()
+			tryHandoff()
 
-		case done := <-s.flushCh:
-			s.doFlush()
-			close(done)
+		case done := <-s.flushReqCh:
+			// Blocking sends here are intentional: an explicit flush must
+			// enqueue the current batch and its marker in order, then the
+			// caller waits on done (closed by shipLoop after prior work).
+			if len(events) > 0 {
+				s.batchCh <- flushWork{batch: events}
+				events = nil
+			}
+			s.batchCh <- flushWork{done: done}
 
 		case <-s.stopCh:
-			// Drain remaining events from channel
-			for {
-				select {
-				case event := <-s.eventsCh:
-					s.mu.Lock()
-					s.events = append(s.events, event)
-					s.mu.Unlock()
-				default:
-					s.doFlush()
-					return
-				}
-			}
+			s.drainAndStop(events)
+			return
 		}
 	}
 }
 
-// doFlush sends the current batch to the ingest URL.
-func (s *shipper) doFlush() {
-	s.mu.Lock()
-	if len(s.events) == 0 {
-		s.mu.Unlock()
-		return
+// drainAndStop pulls any remaining events out of eventsCh, appends them to the
+// pending accumulator, hands them off in BatchSize-sized chunks (B8), and then
+// closes batchCh so the flush worker finishes and exits.
+func (s *shipper) drainAndStop(events []Event) {
+	for {
+		select {
+		case event := <-s.eventsCh:
+			events = append(events, event)
+		default:
+			// Chunk the drained events into BatchSize-sized batches.
+			for len(events) > 0 {
+				n := s.cfg.BatchSize
+				if n > len(events) {
+					n = len(events)
+				}
+				s.batchCh <- flushWork{batch: events[:n:n]}
+				events = events[n:]
+			}
+			close(s.batchCh)
+			return
+		}
 	}
+}
 
-	// Take the current batch
-	batch := s.events
-	s.events = make([]Event, 0, s.cfg.BatchSize)
-	s.mu.Unlock()
+// shipLoop is the single flush worker. It consumes batchCh in order, preserving
+// batch ordering, and performs the HTTP POST for each batch.
+func (s *shipper) shipLoop() {
+	defer close(s.flushDone)
+	for work := range s.batchCh {
+		if len(work.batch) > 0 {
+			s.shipBatch(work.batch)
+		}
+		if work.done != nil {
+			close(work.done)
+		}
+	}
+}
 
+// shipBatch serializes the batch to NDJSON, optionally gzips it, and POSTs it to
+// the ingest URL with up to maxRetries retries. All HTTP work is bound to the
+// shipper context so it can be cancelled during shutdown (B4).
+func (s *shipper) shipBatch(batch []Event) {
 	// Build NDJSON payload
 	var buf bytes.Buffer
 	for _, event := range batch {
@@ -140,7 +228,6 @@ func (s *shipper) doFlush() {
 		return
 	}
 
-	// Prepare payload bytes for potential retries
 	payload := buf.Bytes()
 
 	// Compress once before the retry loop if gzip is enabled
@@ -165,13 +252,23 @@ func (s *shipper) doFlush() {
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
-			// Exponential backoff: 1s, 2s, 4s
+			// Exponential backoff: 1s, 2s, 4s. Abort early if the context is
+			// cancelled (e.g. during shutdown).
 			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
 			fmt.Fprintf(os.Stderr, "monitor: retrying flush (attempt %d/%d) after %v\n", attempt, maxRetries, backoff)
-			time.Sleep(backoff)
+			select {
+			case <-time.After(backoff):
+			case <-s.ctx.Done():
+				fmt.Fprintf(os.Stderr, "monitor: shutdown cancelled retrying flush, dropping batch\n")
+				return
+			}
 		}
 
-		req, err := http.NewRequest(http.MethodPost, s.cfg.IngestURL, bytes.NewReader(shipPayload))
+		if s.ctx.Err() != nil {
+			return
+		}
+
+		req, err := http.NewRequestWithContext(s.ctx, http.MethodPost, s.cfg.IngestURL, bytes.NewReader(shipPayload))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "monitor: failed to create request: %v\n", err)
 			return
@@ -187,8 +284,11 @@ func (s *shipper) doFlush() {
 
 		resp, err := s.client.Do(req)
 		if err != nil {
-			// Network error — retry
+			// Network error (or context cancellation) — retry unless cancelled.
 			fmt.Fprintf(os.Stderr, "monitor: failed to ship events: %v\n", err)
+			if s.ctx.Err() != nil {
+				return
+			}
 			if attempt == maxRetries {
 				fmt.Fprintf(os.Stderr, "monitor: dropping batch after %d retries\n", maxRetries)
 				return

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"time"
 )
 
@@ -129,37 +130,60 @@ func MiddlewareWithConfig(cfg MiddlewareConfig) func(http.Handler) http.Handler 
 				maxBodySize:    cfg.MaxBodySize,
 			}
 
+			// The event is emitted from a deferred function so that duration and
+			// status are always captured — including when the handler panics.
+			// On panic we emit a fatal event with the panic value + stack and
+			// then re-panic so upstream behavior (e.g. the server's own recovery)
+			// is preserved.
+			defer func() {
+				rec := recover()
+
+				duration := time.Since(start)
+
+				data := map[string]any{
+					"request_method":        r.Method,
+					"request_path":          r.URL.Path,
+					"request_query":         r.URL.RawQuery,
+					"response_status":       rw.statusCode,
+					"duration_ms":           duration.Milliseconds(),
+					"response_content_type": rw.Header().Get("Content-Type"),
+					"request_headers": map[string]string{
+						"Content-Type": r.Header.Get("Content-Type"),
+						"User-Agent":   r.Header.Get("User-Agent"),
+					},
+				}
+
+				if cfg.CaptureRequestBody && reqBody != "" {
+					data["request_body"] = reqBody
+				}
+				if cfg.CaptureResponseBody && rw.body.Len() > 0 {
+					data["response_body"] = rw.body.String()
+				}
+
+				level := LevelInfo
+				if rw.statusCode >= 500 {
+					level = LevelError
+				}
+
+				if rec != nil {
+					// A panicking handler that never wrote a status is a 500.
+					if !rw.wroteHeader {
+						data["response_status"] = http.StatusInternalServerError
+					}
+					data["panic"] = fmt.Sprintf("%v", rec)
+					data["stack"] = string(debug.Stack())
+					level = LevelError
+				}
+
+				emitInternal(ctx, "http.request", data, level)
+
+				// Preserve upstream behavior by re-panicking.
+				if rec != nil {
+					panic(rec)
+				}
+			}()
+
 			next.ServeHTTP(rw, r.WithContext(ctx))
-
-			duration := time.Since(start)
-
-			// Build event data
-			data := map[string]any{
-				"request_method":        r.Method,
-				"request_path":          r.URL.Path,
-				"request_query":         r.URL.RawQuery,
-				"response_status":       rw.statusCode,
-				"duration_ms":           duration.Milliseconds(),
-				"response_content_type": rw.Header().Get("Content-Type"),
-				"request_headers": map[string]string{
-					"Content-Type": r.Header.Get("Content-Type"),
-					"User-Agent":   r.Header.Get("User-Agent"),
-				},
-			}
-
-			if cfg.CaptureRequestBody && reqBody != "" {
-				data["request_body"] = reqBody
-			}
-			if cfg.CaptureResponseBody && rw.body.Len() > 0 {
-				data["response_body"] = rw.body.String()
-			}
-
-			level := LevelInfo
-			if rw.statusCode >= 500 {
-				level = LevelError
-			}
-
-			emitInternal(ctx, "http.request", data, level)
 		})
 	}
 }

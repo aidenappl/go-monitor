@@ -38,6 +38,10 @@ func (t *monitorTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	ctx := req.Context()
 	start := time.Now()
 
+	// The RoundTripper contract forbids mutating the caller's request, so clone
+	// it before injecting headers.
+	req = req.Clone(ctx)
+
 	// Propagate trace_id and request_id into outbound headers
 	if traceID := TraceID(ctx); traceID != "" {
 		req.Header.Set(HeaderTraceID, traceID)

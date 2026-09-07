@@ -221,7 +221,7 @@ The shipper:
 - Buffers events in memory
 - Flushes when batch size is reached or flush interval elapses
 - Sends NDJSON payloads via HTTP POST
-- Uses `Authorization: Bearer <api-key>` if APIKey is set
+- Sends the `X-Api-Key: <api-key>` header if APIKey is set
 - Supports gzip compression
 
 ## License

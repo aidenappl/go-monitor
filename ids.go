@@ -12,10 +12,16 @@ func generateID() string {
 	return generateUUID()
 }
 
-// generateShortID creates a UUID v4 (random) format ID.
-// For consistency, all IDs use the same UUID format.
+// generateShortID creates a short, 8 hex-character random ID (32 bits of
+// randomness). It is used for human-facing correlation IDs — the process-level
+// job_id and per-request request_id — where a compact, log-friendly token is
+// preferable to a full 36-character UUID.
 func generateShortID() string {
-	return generateUUID()
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		panic("monitor: failed to generate random ID: " + err.Error())
+	}
+	return fmt.Sprintf("%08x", b)
 }
 
 // generateUUID creates a UUID v4 (random) format string.

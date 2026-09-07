@@ -89,9 +89,9 @@ func TestGenerateID(t *testing.T) {
 
 func TestGenerateShortID(t *testing.T) {
 	id := generateShortID()
-	// Now uses same UUID format as generateID
-	if len(id) != 36 {
-		t.Errorf("generateShortID() length = %d, want 36 (UUID format)", len(id))
+	// Short IDs are 8 hex characters (32 bits of randomness).
+	if len(id) != 8 {
+		t.Errorf("generateShortID() length = %d, want 8 (short hex)", len(id))
 	}
 
 	// Should be unique

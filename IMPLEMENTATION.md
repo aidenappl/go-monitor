@@ -63,10 +63,17 @@
 
 ## Shipper Behavior
 
-- **Buffer**: In-memory slice, capacity = `BatchSize`
-- **Flush triggers**: Timer (`FlushEvery`) or buffer full
+- **Buffer**: Buffered channel, capacity = `BatchSize * 2`, drained by the
+  accumulator goroutine into an in-memory batch slice
+- **Flush triggers**: Timer (`FlushEvery`), batch full, or explicit `Flush()`
+- **Concurrency**: An accumulator goroutine drains the channel and never blocks
+  on network I/O; a single dedicated flush-worker goroutine performs the ordered
+  HTTP POSTs, so retries don't stall event intake
 - **Transport**: HTTP POST with optional gzip, `X-Api-Key` header
-- **Failure handling**: Logs to stderr, does not retry
+- **Failure handling**: Logs to stderr; retries up to 3× on 5xx/network errors
+  with exponential backoff (1s/2s/4s); drops on 4xx. Retries and in-flight
+  requests are bound to a context that is cancelled on `Shutdown` (bounded by a
+  short shutdown timeout)
 
 ## Thread Safety
 
