@@ -89,9 +89,12 @@ func TestGenerateID(t *testing.T) {
 
 func TestGenerateShortID(t *testing.T) {
 	id := generateShortID()
-	// Short IDs are 8 hex characters (32 bits of randomness).
-	if len(id) != 8 {
-		t.Errorf("generateShortID() length = %d, want 8 (short hex)", len(id))
+	// Derived from SHORT_ID_BYTES rather than hardcoded. The literal 8 here is
+	// what pinned the 32-bit width that collided within days at real request
+	// volume and was rejected outright by monitor-core — a test asserting the
+	// bug rather than the contract. ids_test.go holds the checks that matter.
+	if want := SHORT_ID_BYTES * 2; len(id) != want {
+		t.Errorf("generateShortID() length = %d, want %d", len(id), want)
 	}
 
 	// Should be unique
