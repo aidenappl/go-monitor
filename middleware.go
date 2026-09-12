@@ -23,14 +23,17 @@ const (
 // propagateIDs extracts or generates request_id, trace_id, and job_id,
 // stores them in the context, and sets response headers for debugging.
 func propagateIDs(ctx context.Context, r *http.Request, w http.ResponseWriter) context.Context {
+	// Inbound ids are caller-controlled. One monitor-core would reject is
+	// replaced, not propagated: it would be cleared from every event anyway,
+	// leaving the request with no id at all instead of a fresh one.
 	requestID := r.Header.Get(HeaderRequestID)
-	if requestID == "" {
+	if requestID == "" || !ValidCorrelationID(requestID) {
 		requestID = generateShortID()
 	}
 	ctx = WithRequestID(ctx, requestID)
 
 	traceID := r.Header.Get(HeaderTraceID)
-	if traceID == "" {
+	if traceID == "" || !ValidCorrelationID(traceID) {
 		traceID = generateID()
 	}
 	ctx = WithTraceID(ctx, traceID)
@@ -56,6 +59,9 @@ func propagateIDs(ctx context.Context, r *http.Request, w http.ResponseWriter) c
 // otherwise generates new ones. The IDs are stored in the request context
 // and also set as response headers for debugging.
 //
+// It emits no events of its own: pair it with MiddlewareWithConfig, or emit
+// from the handler, to get a per-request event.
+//
 // Compatible with gorilla/mux and any standard net/http router.
 //
 // Usage:
@@ -72,9 +78,14 @@ func Middleware(next http.Handler) http.Handler {
 // MiddlewareConfig configures the enhanced HTTP middleware.
 type MiddlewareConfig struct {
 	// CaptureRequestBody enables capturing the request body in events.
+	//
+	// Bodies pass through redaction, but redaction recognizes credentials by
+	// key and by shape — it cannot know that a free-text field is sensitive.
+	// Leave this off on any endpoint that accepts secrets or personal data.
 	CaptureRequestBody bool
 
 	// CaptureResponseBody enables capturing the response body in events.
+	// The same caution applies.
 	CaptureResponseBody bool
 
 	// MaxBodySize is the maximum bytes to capture for request/response bodies.
@@ -83,6 +94,31 @@ type MiddlewareConfig struct {
 
 	// SkipPaths is a list of paths to skip monitoring (e.g., "/healthcheck").
 	SkipPaths []string
+
+	// CaptureQuery includes the raw query string as request_query. Default:
+	// false. Query strings are where OAuth codes, tokens and emails travel, and
+	// anything captured is retained for the life of the event store. When
+	// enabled, credential-shaped parameters are still redacted.
+	CaptureQuery bool
+
+	// RouteTemplate returns the matched route pattern for a request, e.g.
+	// "/stacks/{id}". When it returns a non-empty string, that becomes the
+	// event's path — the field Monitor groups issues by — and the concrete
+	// path is kept as request_path. Without it, every id in a URL splits one
+	// failing endpoint into an issue per id.
+	//
+	// With gorilla/mux (register this middleware with Router.Use so the route
+	// is matched before it runs):
+	//
+	//	RouteTemplate: func(r *http.Request) string {
+	//		if rt := mux.CurrentRoute(r); rt != nil {
+	//			if t, err := rt.GetPathTemplate(); err == nil {
+	//				return t
+	//			}
+	//		}
+	//		return ""
+	//	},
+	RouteTemplate func(r *http.Request) string
 }
 
 // MiddlewareWithConfig returns an HTTP middleware that captures detailed
@@ -140,19 +176,43 @@ func MiddlewareWithConfig(cfg MiddlewareConfig) func(http.Handler) http.Handler 
 
 				duration := time.Since(start)
 
+				status := rw.statusCode
+				if rec != nil && !rw.wroteHeader {
+					// A panicking handler that never wrote a status is a 500.
+					status = http.StatusInternalServerError
+				}
+
+				// path is what Monitor groups issues by. The route template
+				// ("/stacks/{id}") keeps one failing endpoint one issue; the raw
+				// path would split it per id and turn the ids into a dimension.
+				path := r.URL.Path
+				route := ""
+				if cfg.RouteTemplate != nil {
+					if route = cfg.RouteTemplate(r); route != "" {
+						path = route
+					}
+				}
+
 				data := map[string]any{
+					"method":                r.Method,
+					"path":                  path,
+					"status_code":           status,
+					"duration_ms":           duration.Milliseconds(),
 					"request_method":        r.Method,
 					"request_path":          r.URL.Path,
-					"request_query":         r.URL.RawQuery,
-					"response_status":       rw.statusCode,
-					"duration_ms":           duration.Milliseconds(),
+					"response_status":       status,
 					"response_content_type": rw.Header().Get("Content-Type"),
 					"request_headers": map[string]string{
 						"Content-Type": r.Header.Get("Content-Type"),
 						"User-Agent":   r.Header.Get("User-Agent"),
 					},
 				}
-
+				if route != "" {
+					data["route"] = route
+				}
+				if cfg.CaptureQuery && r.URL.RawQuery != "" {
+					data["request_query"] = r.URL.RawQuery
+				}
 				if cfg.CaptureRequestBody && reqBody != "" {
 					data["request_body"] = reqBody
 				}
@@ -161,16 +221,19 @@ func MiddlewareWithConfig(cfg MiddlewareConfig) func(http.Handler) http.Handler 
 				}
 
 				level := LevelInfo
-				if rw.statusCode >= 500 {
+				switch {
+				case status >= 500:
 					level = LevelError
+				case status >= 400:
+					level = LevelWarn
 				}
 
 				if rec != nil {
-					// A panicking handler that never wrote a status is a 500.
-					if !rw.wroteHeader {
-						data["response_status"] = http.StatusInternalServerError
-					}
-					data["panic"] = fmt.Sprintf("%v", rec)
+					msg := fmt.Sprintf("%v", rec)
+					data["panic"] = msg
+					// error is what Monitor's fingerprint reads: it makes each
+					// distinct panic its own issue instead of one "500" bucket.
+					data["error"] = msg
 					data["stack"] = string(debug.Stack())
 					level = LevelError
 				}

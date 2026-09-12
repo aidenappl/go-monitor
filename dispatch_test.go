@@ -27,7 +27,7 @@ func withStdoutBuffer(t *testing.T) *bytes.Buffer {
 func TestDispatchWritesToStdout(t *testing.T) {
 	buf := withStdoutBuffer(t)
 
-	if err := Init(Config{Service: "stdout-test", DisableStdout: false, JobID: "job-1"}); err != nil {
+	if err := Init(Config{Service: "stdout-test", DisableStdout: false, JobID: "10b0000000000001"}); err != nil {
 		t.Fatalf("Init() error = %v", err)
 	}
 
@@ -73,7 +73,7 @@ func TestDispatchRespectsDisableStdout(t *testing.T) {
 func TestMiddlewarePanicRecovery(t *testing.T) {
 	buf := withStdoutBuffer(t)
 
-	if err := Init(Config{Service: "panic-test", DisableStdout: false, JobID: "job-p"}); err != nil {
+	if err := Init(Config{Service: "panic-test", DisableStdout: false, JobID: "10b0000000000002"}); err != nil {
 		t.Fatalf("Init() error = %v", err)
 	}
 

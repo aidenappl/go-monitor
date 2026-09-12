@@ -8,7 +8,7 @@ import (
 )
 
 func TestMiddlewareWithConfig(t *testing.T) {
-	if err := Init(Config{Service: "test-mw", DisableStdout: true, JobID: "mw-job"}); err != nil {
+	if err := Init(Config{Service: "test-mw", DisableStdout: true, JobID: "3000000000000001"}); err != nil {
 		t.Fatalf("Init() error = %v", err)
 	}
 
@@ -168,17 +168,17 @@ func TestMiddlewareWithConfig(t *testing.T) {
 		wrapped := mw(handler)
 
 		req := httptest.NewRequest("GET", "/test", nil)
-		req.Header.Set(HeaderRequestID, "existing-req")
-		req.Header.Set(HeaderTraceID, "existing-trace")
+		req.Header.Set(HeaderRequestID, "e5000000000000a1")
+		req.Header.Set(HeaderTraceID, "e5000000-0000-4000-8000-0000000000a1")
 		rec := httptest.NewRecorder()
 
 		wrapped.ServeHTTP(rec, req)
 
-		if gotRequestID != "existing-req" {
-			t.Errorf("request ID = %v, want existing-req", gotRequestID)
+		if gotRequestID != "e5000000000000a1" {
+			t.Errorf("request ID = %v, want e5000000000000a1", gotRequestID)
 		}
-		if gotTraceID != "existing-trace" {
-			t.Errorf("trace ID = %v, want existing-trace", gotTraceID)
+		if gotTraceID != "e5000000-0000-4000-8000-0000000000a1" {
+			t.Errorf("trace ID = %v, want e5000000-0000-4000-8000-0000000000a1", gotTraceID)
 		}
 	})
 }

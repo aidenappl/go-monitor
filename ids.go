@@ -3,6 +3,7 @@ package monitor
 import (
 	"crypto/rand"
 	"fmt"
+	"regexp"
 )
 
 // generateID creates a UUID v4 (random) format ID.
@@ -25,11 +26,11 @@ func generateID() string {
 //
 // THE WIRE CONTRACT. monitor-core validates these fields against
 // structs.correlationIDRegex and rejects anything outside it. Because ingest is
-// all-or-nothing and shipBatch drops 4xx WITHOUT RETRYING (see shipper.go), one
-// rejected id destroys the whole batch — so a service on a build whose ids
-// monitor-core does not accept loses 100% of its events, with one line on
-// stderr and nothing in Monitor to say so. That is not hypothetical: the 32-bit
-// form shipped while monitor-core still required a hyphenated UUID.
+// all-or-nothing, one rejected id used to destroy the whole batch. Events are
+// now sanitized before they are batched (see validate.go) and a rejected batch
+// is bisected rather than dropped (see shipper.go), but ids minted HERE must
+// still always pass — nothing downstream can repair an id the SDK itself got
+// wrong.
 //
 // ids_test.go asserts every id this file mints against monitor-core's exact
 // regex. If you change the format, that test is the thing that has to pass —
@@ -62,3 +63,34 @@ func generateUUID() string {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
+
+// correlationIDPattern is monitor-core's structs.correlationIDRegex, verbatim.
+// ids_test.go pins it to the independent copy the tests assert against, so the
+// SDK's own check cannot drift from the server's without a failing test.
+const correlationIDPattern = `^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{8,64})$`
+
+var correlationIDRegex = regexp.MustCompile(correlationIDPattern)
+
+// ValidCorrelationID reports whether monitor-core would accept id as a job_id,
+// request_id or trace_id. The empty string is valid — the server skips empty
+// ids — so an unset field never needs repairing.
+//
+// Use it at trust boundaries: an inbound X-Request-Id header is caller-supplied,
+// and anything outside this shape would be cleared from the event anyway.
+func ValidCorrelationID(id string) bool {
+	return id == "" || correlationIDRegex.MatchString(id)
+}
+
+// NewRequestID mints a request_id monitor-core accepts: 16 hex characters.
+func NewRequestID() string { return generateShortID() }
+
+// NewJobID mints a job_id monitor-core accepts: 16 hex characters.
+//
+// Daemons have no inbound request to take an id from, so every event in a
+// long-lived process otherwise shares the one process-level job_id. Mint one per
+// unit of work (a deploy, a snapshot, a cron run) and attach it with WithJobID
+// to make that work findable as a unit.
+func NewJobID() string { return generateShortID() }
+
+// NewTraceID mints a trace_id monitor-core accepts: a hyphenated UUID v4.
+func NewTraceID() string { return generateUUID() }

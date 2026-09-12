@@ -53,9 +53,15 @@ func (t *monitorTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	resp, err := t.base.RoundTrip(req)
 	duration := time.Since(start)
 
+	// The query string, fragment and userinfo are left out of the URL: they are
+	// where credentials in URLs live, and anything captured is retained for the
+	// life of the event store.
+	u := *req.URL
+	u.RawQuery, u.Fragment, u.User = "", "", nil
 	data := map[string]any{
 		"request_method": req.Method,
-		"request_url":    req.URL.String(),
+		"request_url":    u.String(),
+		"request_host":   req.URL.Host,
 		"duration_ms":    duration.Milliseconds(),
 	}
 
@@ -79,8 +85,7 @@ func (t *monitorTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 // emitInternal emits an event without source location capture, used by
 // internal SDK components where caller location is not meaningful.
 func emitInternal(ctx context.Context, name string, data any, level string) {
-	cfg := globalConfig.Load()
-	if cfg == nil {
+	if globalConfig.Load() == nil && activeRecorder.Load() == nil {
 		return
 	}
 

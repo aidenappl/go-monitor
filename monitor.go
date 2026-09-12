@@ -92,6 +92,65 @@ type Config struct {
 	// that anything slow holds, or you have made Emit block — the thing this SDK
 	// promises never to do. A panic here is recovered and logged.
 	OnDrop func(total int64)
+
+	// SpoolDir enables the durable on-disk spool. Empty (the default) keeps
+	// events in memory only, where a Monitor outage longer than the retry
+	// window (~7s) loses them.
+	//
+	// With a spool every batch is written to <SpoolDir>/<Service>/ before it is
+	// shipped, and deleted only once ingest accepts it. Monitor can be down for
+	// hours — or this process restarted in the meantime — and the events ship
+	// when it answers. Init still never touches the network or blocks: this is
+	// what lets a service report to a Monitor it may be hosting.
+	//
+	// One process per directory: a second process on the same path falls back
+	// to memory with a warning. The directory must survive restarts to be
+	// useful — a host path or a named volume, never a container's writable
+	// layer, which is destroyed by the image-update redeploy it would need to
+	// survive.
+	SpoolDir string
+
+	// SpoolMaxBytes caps the spool on disk. Default: 64 MiB. When full, the
+	// oldest events are evicted (and counted as dropped) to make room.
+	SpoolMaxBytes int64
+
+	// SpoolMinFreeBytes is the free-disk floor: below it nothing more is
+	// spooled and new events are dropped (and counted). Default: 512 MiB;
+	// negative disables the check. A telemetry buffer that fills the disk of
+	// the host it reports on causes the outage it was meant to record.
+	SpoolMinFreeBytes int64
+
+	// SpoolSyncEvery is how often spooled writes are fsynced. Default: 500ms.
+	// A process crash loses nothing either way; this bounds what a host crash
+	// can lose.
+	SpoolSyncEvery time.Duration
+
+	// MaxBackoff caps the delay between delivery attempts of spooled events.
+	// Default: 5m.
+	MaxBackoff time.Duration
+
+	// DrainRate is the maximum number of requests per second used to deliver
+	// spooled events. Default: 5 — with the default BatchSize, up to 1,000
+	// events/s. It keeps a recovering fleet from hitting Monitor with every
+	// backlog at once.
+	DrainRate float64
+
+	// RedactKeys adds data keys whose values are always replaced with
+	// [REDACTED], on top of the built-in credential keys (password, secret,
+	// token, api_key, authorization, cookie, dsn, …). Matching ignores case
+	// and '_', '-', '.' separators.
+	RedactKeys []string
+
+	// RedactAllowKeys exempts data keys from key-based redaction — for a key
+	// that names a credential without holding one, like a secrets manager's
+	// "secret_key" (the NAME of a secret). Values are still scanned for
+	// credential patterns.
+	RedactAllowKeys []string
+
+	// DisableRedaction turns off redaction entirely. There is no good reason
+	// to set this outside a test. Error values are still converted to their
+	// messages, which encoding/json would otherwise render as {}.
+	DisableRedaction bool
 }
 
 // globalConfig stores the initialized configuration atomically.
@@ -99,6 +158,27 @@ var globalConfig atomic.Pointer[Config]
 
 // globalShipper stores the active shipper (if any).
 var globalShipper atomic.Pointer[shipper]
+
+// globalRedactor is the redactor built from the active config.
+var globalRedactor atomic.Pointer[redactor]
+
+// defaultRedactor applies the built-in rules when no config is active (a test
+// recording without Init).
+var defaultRedactor = newRedactor(nil)
+
+// currentRedactor returns the redactor for cfg, or nil if redaction is off.
+func currentRedactor(cfg *Config) *redactor {
+	if cfg == nil {
+		return defaultRedactor
+	}
+	if cfg.DisableRedaction {
+		return passthroughRedactor
+	}
+	if r := globalRedactor.Load(); r != nil {
+		return r
+	}
+	return defaultRedactor
+}
 
 // ErrNotInitialized is returned when Emit is called before Init.
 var ErrNotInitialized = errors.New("monitor: not initialized, call Init first")
@@ -116,6 +196,11 @@ func Init(cfg Config) error {
 	// Apply defaults
 	if cfg.JobID == "" {
 		cfg.JobID = generateShortID()
+	} else if !ValidCorrelationID(cfg.JobID) {
+		// Every event carries this id, so an invalid one would be cleared from
+		// every event this process ever sends. Replace it once, loudly.
+		fmt.Fprintf(stderrWriter, "monitor: Config.JobID %q is not an id monitor-core accepts (a UUID or 8-64 hex characters); using a generated one instead\n", cfg.JobID)
+		cfg.JobID = generateShortID()
 	}
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = 200
@@ -130,6 +215,7 @@ func Init(cfg Config) error {
 	}
 
 	// Store the config
+	globalRedactor.Store(newRedactor(&cfg))
 	globalConfig.Store(&cfg)
 
 	// Start shipper if IngestURL is configured
@@ -229,7 +315,7 @@ func attachSourceLocation(event *Event, callerDepth int) {
 // If any ID is missing from the context, it will be generated.
 func Emit(ctx context.Context, name string, data any, opts ...EmitOption) {
 	cfg := globalConfig.Load()
-	if cfg == nil {
+	if cfg == nil && activeRecorder.Load() == nil {
 		return
 	}
 
@@ -240,7 +326,7 @@ func Emit(ctx context.Context, name string, data any, opts ...EmitOption) {
 	event := newEvent(ctx, name, data, o.Level)
 
 	// Attach source location if enabled
-	if captureSourceEnabled(cfg) {
+	if cfg == nil || captureSourceEnabled(cfg) {
 		attachSourceLocation(&event, 2)
 	}
 
@@ -251,23 +337,33 @@ func Emit(ctx context.Context, name string, data any, opts ...EmitOption) {
 // events with the correct caller depth for source location capture.
 func emitWithCallerDepth(ctx context.Context, name string, data any, level string, callerDepth int) {
 	cfg := globalConfig.Load()
-	if cfg == nil {
+	if cfg == nil && activeRecorder.Load() == nil {
 		return
 	}
 
 	event := newEvent(ctx, name, data, level)
 
-	if captureSourceEnabled(cfg) {
+	if cfg == nil || captureSourceEnabled(cfg) {
 		attachSourceLocation(&event, callerDepth+1)
 	}
 
 	dispatchEvent(event)
 }
 
-// dispatchEvent handles stdout output and shipper send for an event.
+// dispatchEvent sanitizes and redacts an event, then prints and ships it.
+//
+// Sanitizing here, before stdout, the recorder and the shipper, means every
+// destination sees the same event — and no destination ever sees a secret the
+// others did not.
 func dispatchEvent(event Event) {
 	cfg := globalConfig.Load()
-	if cfg == nil {
+	rec := activeRecorder.Load()
+	if cfg == nil && rec == nil {
+		return
+	}
+	sanitizeEvent(&event, currentRedactor(cfg))
+	if rec != nil {
+		rec.record(event)
 		return
 	}
 	if !cfg.DisableStdout {

@@ -13,15 +13,30 @@ type ShipperStats struct {
 	Enqueued int64
 
 	// Dropped is the number of events the shipper lost and will never deliver:
-	// refused because the buffer was full, unserializable, or in a batch
-	// abandoned after retries / rejected with a 4xx. A counter that only tracked
-	// the full-buffer case would report 0 while an expired API key silently
+	// refused because the buffer was full, unserializable, quarantined as
+	// malformed, abandoned after retries, refused with a 401/403/404 without a
+	// spool, or evicted from a full spool. A counter that only tracked the
+	// full-buffer case would report 0 while an expired API key silently
 	// discarded every batch.
 	Dropped int64
 
-	// Flushed is the number of events the ingest endpoint accepted (a response
-	// under 400). Enqueued minus Flushed minus Dropped is what is still in flight.
+	// Flushed is the number of events the ingest endpoint accepted.
 	Flushed int64
+
+	// Quarantined is the part of Dropped that ingest refused as malformed even
+	// after bisection isolated them one by one. It points at a defect in the
+	// emitting code rather than in the pipeline; with a spool, the events are
+	// kept in poison.ndjson so it can be found.
+	Quarantined int64
+
+	// Spooled is the number of events written to the disk spool (0 without one).
+	Spooled int64
+
+	// Pending is the number of events on disk waiting for delivery, and
+	// PendingBytes their size. Pending climbing while Flushed stands still is
+	// what a Monitor outage looks like from the service's side.
+	Pending      int64
+	PendingBytes int64
 }
 
 // Stats reports the active shipper's counters.
@@ -35,9 +50,16 @@ func Stats() ShipperStats {
 	if s == nil {
 		return ShipperStats{}
 	}
-	return ShipperStats{
-		Enqueued: s.enqueued.Load(),
-		Dropped:  s.dropped.Load(),
-		Flushed:  s.flushed.Load(),
+	st := ShipperStats{
+		Enqueued:    s.enqueued.Load(),
+		Dropped:     s.dropped.Load(),
+		Flushed:     s.flushed.Load(),
+		Quarantined: s.quarantined.Load(),
 	}
+	if sp := s.spool; sp != nil {
+		st.Spooled = sp.spooled.Load()
+		st.Pending = sp.pendingLines.Load()
+		st.PendingBytes = sp.pendingBytes.Load()
+	}
+	return st
 }

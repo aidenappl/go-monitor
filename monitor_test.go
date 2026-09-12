@@ -25,7 +25,7 @@ func TestInit(t *testing.T) {
 	})
 
 	t.Run("valid config with all fields", func(t *testing.T) {
-		err := Init(Config{Service: "test-service", Env: "test", JobID: "custom-job-id"})
+		err := Init(Config{Service: "test-service", Env: "test", JobID: "c057000000000001"})
 		if err != nil {
 			t.Errorf("Init() error = %v, want nil", err)
 		}
@@ -106,7 +106,7 @@ func TestGenerateShortID(t *testing.T) {
 
 func TestEvent(t *testing.T) {
 	// Initialize monitor first
-	if err := Init(Config{Service: "test-service", Env: "test", JobID: "test-job"}); err != nil {
+	if err := Init(Config{Service: "test-service", Env: "test", JobID: "7e57000000000001"}); err != nil {
 		t.Fatalf("Init() error = %v", err)
 	}
 
@@ -123,8 +123,8 @@ func TestEvent(t *testing.T) {
 	if event.Env != "test" {
 		t.Errorf("event.Env = %v, want test", event.Env)
 	}
-	if event.JobID != "test-job" {
-		t.Errorf("event.JobID = %v, want test-job", event.JobID)
+	if event.JobID != "7e57000000000001" {
+		t.Errorf("event.JobID = %v, want 7e57000000000001", event.JobID)
 	}
 	if event.RequestID != "req-123" {
 		t.Errorf("event.RequestID = %v, want req-123", event.RequestID)
@@ -171,7 +171,7 @@ func TestEvent(t *testing.T) {
 }
 
 func TestEventMissingIDs(t *testing.T) {
-	if err := Init(Config{Service: "test-service", JobID: "global-job"}); err != nil {
+	if err := Init(Config{Service: "test-service", JobID: "910ba10000000001"}); err != nil {
 		t.Fatalf("Init() error = %v", err)
 	}
 
@@ -179,8 +179,8 @@ func TestEventMissingIDs(t *testing.T) {
 	ctx := context.Background()
 	event := newEvent(ctx, "test.event", nil, "")
 
-	if event.JobID != "global-job" {
-		t.Errorf("event.JobID = %v, want global-job (from config)", event.JobID)
+	if event.JobID != "910ba10000000001" {
+		t.Errorf("event.JobID = %v, want 910ba10000000001 (from config)", event.JobID)
 	}
 	// request_id and trace_id should be empty when not in context
 	if event.RequestID != "" {
@@ -195,7 +195,7 @@ func TestEventMissingIDs(t *testing.T) {
 }
 
 func TestEventOmitsEmptyIDs(t *testing.T) {
-	if err := Init(Config{Service: "test-service", JobID: "only-job"}); err != nil {
+	if err := Init(Config{Service: "test-service", JobID: "0e1a000000000001"}); err != nil {
 		t.Fatalf("Init() error = %v", err)
 	}
 
@@ -227,7 +227,7 @@ func TestEventOmitsEmptyIDs(t *testing.T) {
 }
 
 func TestMiddleware(t *testing.T) {
-	if err := Init(Config{Service: "test-service", JobID: "middleware-test-job"}); err != nil {
+	if err := Init(Config{Service: "test-service", JobID: "3dd1e7e570000001"}); err != nil {
 		t.Fatalf("Init() error = %v", err)
 	}
 
@@ -257,8 +257,8 @@ func TestMiddleware(t *testing.T) {
 		if gotTraceID == "" {
 			t.Error("TraceID should be generated")
 		}
-		if gotJobID != "middleware-test-job" {
-			t.Errorf("JobID = %v, want middleware-test-job", gotJobID)
+		if gotJobID != "3dd1e7e570000001" {
+			t.Errorf("JobID = %v, want 3dd1e7e570000001", gotJobID)
 		}
 
 		// Check response headers
@@ -274,24 +274,24 @@ func TestMiddleware(t *testing.T) {
 		gotRequestID, gotTraceID, gotJobID = "", "", ""
 
 		req := httptest.NewRequest("GET", "/test", nil)
-		req.Header.Set(HeaderRequestID, "incoming-request-id")
-		req.Header.Set(HeaderTraceID, "incoming-trace-id")
+		req.Header.Set(HeaderRequestID, "1ec0000000000001")
+		req.Header.Set(HeaderTraceID, "1ec00000-0000-4000-8000-000000000001")
 		rec := httptest.NewRecorder()
 
 		wrapped.ServeHTTP(rec, req)
 
-		if gotRequestID != "incoming-request-id" {
-			t.Errorf("RequestID = %v, want incoming-request-id", gotRequestID)
+		if gotRequestID != "1ec0000000000001" {
+			t.Errorf("RequestID = %v, want 1ec0000000000001", gotRequestID)
 		}
-		if gotTraceID != "incoming-trace-id" {
-			t.Errorf("TraceID = %v, want incoming-trace-id", gotTraceID)
+		if gotTraceID != "1ec00000-0000-4000-8000-000000000001" {
+			t.Errorf("TraceID = %v, want 1ec00000-0000-4000-8000-000000000001", gotTraceID)
 		}
 
 		// Response headers should match
-		if rec.Header().Get(HeaderRequestID) != "incoming-request-id" {
+		if rec.Header().Get(HeaderRequestID) != "1ec0000000000001" {
 			t.Error("Response X-Request-Id should match incoming")
 		}
-		if rec.Header().Get(HeaderTraceID) != "incoming-trace-id" {
+		if rec.Header().Get(HeaderTraceID) != "1ec00000-0000-4000-8000-000000000001" {
 			t.Error("Response X-Trace-Id should match incoming")
 		}
 	})
@@ -320,7 +320,7 @@ func TestEmitBeforeInit(t *testing.T) {
 }
 
 func TestEventJSONFormat(t *testing.T) {
-	if err := Init(Config{Service: "json-test", Env: "test", JobID: "json-job"}); err != nil {
+	if err := Init(Config{Service: "json-test", Env: "test", JobID: "15000000000000a1"}); err != nil {
 		t.Fatalf("Init() error = %v", err)
 	}
 
@@ -355,8 +355,8 @@ func TestEventJSONFormat(t *testing.T) {
 	if decoded["service"] != "json-test" {
 		t.Errorf("service = %v, want json-test", decoded["service"])
 	}
-	if decoded["job_id"] != "json-job" {
-		t.Errorf("job_id = %v, want json-job", decoded["job_id"])
+	if decoded["job_id"] != "15000000000000a1" {
+		t.Errorf("job_id = %v, want 15000000000000a1", decoded["job_id"])
 	}
 	if decoded["request_id"] != "json-req" {
 		t.Errorf("request_id = %v, want json-req", decoded["request_id"])
