@@ -9,6 +9,8 @@ A lightweight, structured event monitoring library for Go services with guarante
 - **HTTP middleware**: Gorilla mux compatible middleware that ensures request tracing
 - **NDJSON output**: Events are printed as newline-delimited JSON to stdout
 - **Optional async shipping**: Batch events and POST to an ingest URL with gzip support
+- **Zone assertion**: Verifies at startup that you're pointed at the zone you think you are
+- **Visible loss**: Dropped events are counted (`Stats()`) and reported (`OnDrop`), not just logged
 - **Zero dependencies**: Uses only the Go standard library (except for the example)
 
 ## Installation
@@ -73,12 +75,20 @@ type Config struct {
     // If empty, one will be auto-generated.
     JobID string
 
-    // IngestURL is the URL to POST NDJSON batches to.
-    // If empty, the async shipper is disabled and events only go to stdout.
+    // IngestURL is the URL to POST NDJSON batches to — one zone's full ingest
+    // endpoint. If empty, the async shipper is disabled and events only go to stdout.
     IngestURL string
 
-    // APIKey is an optional API key for authenticating with the ingest endpoint.
+    // APIKey authenticates with the ingest endpoint. Must be minted on the zone
+    // IngestURL points at — the server derives the project from this key.
     APIKey string
+
+    // Zone is the zone this service expects to report into. Never sent on the
+    // wire; verified once at Init against {ingest origin}/health.
+    Zone string
+
+    // DisableZoneVerify opts out of that check. Default: false.
+    DisableZoneVerify bool
 
     // BatchSize is the maximum number of events per batch. Default: 200.
     BatchSize int
@@ -91,8 +101,20 @@ type Config struct {
 
     // DisableStdout disables printing events to stdout. Default: false.
     DisableStdout bool
+
+    // Debug enables debug-level events. Default: false.
+    Debug bool
+
+    // CaptureSource enables source_file/source_line/source_func capture. Default: true.
+    CaptureSource *bool
+
+    // OnDrop is called with the running drop total whenever the shipper loses
+    // events. Must not block — see "Dropped events" below.
+    OnDrop func(total int64)
 }
 ```
+
+Every field except `Service` is optional and safe at its zero value.
 
 ## Event Schema
 
@@ -145,6 +167,9 @@ monitor.Shutdown()
 
 // Manual flush
 monitor.Flush()
+
+// Shipper counters (see "Dropped events")
+monitor.Stats() // ShipperStats{Enqueued, Dropped, Flushed}
 ```
 
 ### Emitting Events
@@ -208,11 +233,12 @@ When `IngestURL` is configured, events are batched and shipped asynchronously:
 ```go
 monitor.Init(monitor.Config{
     Service:     "my-service",
-    IngestURL:   "https://ingest.example.com/events",
-    APIKey:      "your-api-key",
-    BatchSize:   200,        // Events per batch
+    Zone:        "trailblaze",                                  // asserted at Init, never sent
+    IngestURL:   "https://api.monitor.appleby.cloud/v1/events", // that zone's ingest URL
+    APIKey:      os.Getenv("MONITOR_API_KEY"),                  // minted on that zone
+    BatchSize:   200,         // Events per batch
     FlushEvery:  time.Second, // Flush interval
-    GzipEnabled: true,       // Compress batches
+    GzipEnabled: true,        // Compress batches
 })
 ```
 
@@ -223,6 +249,92 @@ The shipper:
 - Sends NDJSON payloads via HTTP POST
 - Sends the `X-Api-Key: <api-key>` header if APIKey is set
 - Supports gzip compression
+
+**One process ships to one destination.** The shipper is a single pointer that `Init`
+replaces, and that is deliberate: a process belongs to one zone. Calling `Init` again
+retargets the whole process rather than adding a second destination — don't build
+fan-out on top of it.
+
+## Targeting a zone
+
+Monitor is multi-tenant. **Zones** are isolated deployments (own API process, own
+ClickHouse, own MariaDB), each containing **projects**. A service picks its zone by
+where it points and what it presents:
+
+| Zone         | `IngestURL`                                          |
+| ------------ | ---------------------------------------------------- |
+| `trailblaze` | `https://api.monitor.appleby.cloud/v1/events`        |
+| `appleby`    | `https://appleby-monitor-api.appleby.cloud/v1/events` |
+
+> `https://monitor.appleby.cloud` is the **web** origin (the dashboard). It ingests
+> nothing — don't point `IngestURL` at it.
+
+**The API key is what decides tenancy.** The event has no `project` field and no `zone`
+field; the server stamps the project from the `api_keys` row behind your key and
+overwrites anything a client sends. So a key minted on the **control plane**, or on
+**another zone**, files this service's events under that zone's project — the batch is
+accepted, the response is a `200`, and the events show up under the wrong tenant with
+nothing wrong anywhere. Use a key minted **on the zone you are pointing at**.
+
+### Zone verification
+
+Set `Zone` and the SDK checks that assumption once at startup, hitting
+`{scheme}://{host}/health` on the ingest URL's origin and comparing the `zone` it
+reports:
+
+```go
+monitor.Init(monitor.Config{
+    Service:   "my-service",
+    Zone:      "trailblaze",
+    IngestURL: "https://api.monitor.appleby.cloud/v1/events",
+    APIKey:    os.Getenv("MONITOR_API_KEY"),
+})
+```
+
+- **Mismatch** → a loud multi-line banner on stderr at startup. Misattributed telemetry
+  cannot be moved afterwards, so this is the only moment anyone can catch it.
+- **Unreachable, or a `/health` that doesn't name a zone** → one quiet line. The service
+  still boots and still ships; a health endpoint being briefly down proves nothing.
+- `Init` never fails or blocks on this — the probe runs on its own goroutine with a 3s
+  timeout.
+- `Zone` is **never** put on the wire. Set `DisableZoneVerify: true` to skip the check.
+
+## Dropped events
+
+The shipper drops events when its buffer is full or when a batch can't be delivered.
+Silent loss is worst here — the system that would have told you is the one that broke —
+so loss is counted, not just logged:
+
+```go
+stats := monitor.Stats()
+// ShipperStats{Enqueued: 1042, Dropped: 3, Flushed: 1039}
+```
+
+| Field      | Meaning                                                                     |
+| ---------- | --------------------------------------------------------------------------- |
+| `Enqueued` | Events accepted into the shipper's buffer                                   |
+| `Dropped`  | Events lost: full buffer, unserializable, or a batch abandoned / `4xx`-rejected |
+| `Flushed`  | Events the ingest endpoint accepted                                          |
+
+`Stats()` returns the zero value when no shipper is running, and counters restart on
+re-`Init`. Surface it on your own health endpoint so loss is visible from outside the
+process that lost it.
+
+To be told instead of polled, set `OnDrop`:
+
+```go
+monitor.Init(monitor.Config{
+    Service:   "my-service",
+    IngestURL: "https://api.monitor.appleby.cloud/v1/events",
+    OnDrop: func(total int64) {
+        droppedEvents.Set(float64(total)) // bump a metric; that's all
+    },
+})
+```
+
+It runs on the goroutine that hit the drop — for a full buffer, the one calling
+`Emit` — so it must not block or do I/O. A panic inside it is recovered and logged; it
+cannot take the shipper down. The existing stderr lines are still printed either way.
 
 ## License
 

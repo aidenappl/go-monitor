@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -51,6 +51,12 @@ type shipper struct {
 
 	ctx    context.Context // cancelled on stop to abort in-flight HTTP (B4)
 	cancel context.CancelFunc
+
+	// Lifetime counters, read by Stats(). Atomic because send() runs on every
+	// caller's goroutine while shipLoop() runs on its own.
+	enqueued atomic.Int64
+	dropped  atomic.Int64
+	flushed  atomic.Int64
 }
 
 // newShipper creates a new shipper with the given config.
@@ -99,10 +105,38 @@ func (s *shipper) stop() {
 func (s *shipper) send(event Event) {
 	select {
 	case s.eventsCh <- event:
+		s.enqueued.Add(1)
 	default:
-		// Channel full, drop event (could log this in debug mode)
-		fmt.Fprintf(os.Stderr, "monitor: shipper buffer full, dropping event\n")
+		// Buffer full: this event is gone. The stderr line stays because it is
+		// the only signal a consumer that sets neither OnDrop nor reads Stats()
+		// will ever get — but it must not be the only one available, since the
+		// service that would have reported the problem is the one dropping.
+		fmt.Fprintf(stderrWriter, "monitor: shipper buffer full, dropping event\n")
+		s.recordDrop(1)
 	}
+}
+
+// recordDrop accounts for n events the shipper will never deliver and notifies
+// the consumer. Every path that abandons events routes through here so Stats()
+// and OnDrop can never disagree with reality.
+func (s *shipper) recordDrop(n int64) {
+	if n <= 0 {
+		return
+	}
+	total := s.dropped.Add(n)
+
+	cb := s.cfg.OnDrop
+	if cb == nil {
+		return
+	}
+	// A consumer's callback must not be able to kill the goroutine that ships
+	// everything else: losing some events is bad, losing the shipper is worse.
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(stderrWriter, "monitor: OnDrop callback panicked: %v\n", r)
+		}
+	}()
+	cb(total)
 }
 
 // flush synchronously flushes all buffered events, blocking until any batch
@@ -212,16 +246,20 @@ func (s *shipper) shipLoop() {
 // the ingest URL with up to maxRetries retries. All HTTP work is bound to the
 // shipper context so it can be cancelled during shutdown (B4).
 func (s *shipper) shipBatch(batch []Event) {
-	// Build NDJSON payload
+	// Build NDJSON payload. lines counts the events actually serialized — it,
+	// not len(batch), is how many events this batch's outcome applies to.
 	var buf bytes.Buffer
+	var lines int64
 	for _, event := range batch {
 		jsonBytes, err := json.Marshal(event)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "monitor: failed to marshal event: %v\n", err)
+			fmt.Fprintf(stderrWriter, "monitor: failed to marshal event: %v\n", err)
+			s.recordDrop(1)
 			continue
 		}
 		buf.Write(jsonBytes)
 		buf.WriteByte('\n')
+		lines++
 	}
 
 	if buf.Len() == 0 {
@@ -236,11 +274,13 @@ func (s *shipper) shipBatch(batch []Event) {
 		var gzipBuf bytes.Buffer
 		gw := gzip.NewWriter(&gzipBuf)
 		if _, err := gw.Write(payload); err != nil {
-			fmt.Fprintf(os.Stderr, "monitor: gzip write failed: %v\n", err)
+			fmt.Fprintf(stderrWriter, "monitor: gzip write failed: %v\n", err)
+			s.recordDrop(lines)
 			return
 		}
 		if err := gw.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "monitor: gzip close failed: %v\n", err)
+			fmt.Fprintf(stderrWriter, "monitor: gzip close failed: %v\n", err)
+			s.recordDrop(lines)
 			return
 		}
 		shipPayload = gzipBuf.Bytes()
@@ -255,22 +295,25 @@ func (s *shipper) shipBatch(batch []Event) {
 			// Exponential backoff: 1s, 2s, 4s. Abort early if the context is
 			// cancelled (e.g. during shutdown).
 			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
-			fmt.Fprintf(os.Stderr, "monitor: retrying flush (attempt %d/%d) after %v\n", attempt, maxRetries, backoff)
+			fmt.Fprintf(stderrWriter, "monitor: retrying flush (attempt %d/%d) after %v\n", attempt, maxRetries, backoff)
 			select {
 			case <-time.After(backoff):
 			case <-s.ctx.Done():
-				fmt.Fprintf(os.Stderr, "monitor: shutdown cancelled retrying flush, dropping batch\n")
+				fmt.Fprintf(stderrWriter, "monitor: shutdown cancelled retrying flush, dropping batch\n")
+				s.recordDrop(lines)
 				return
 			}
 		}
 
 		if s.ctx.Err() != nil {
+			s.recordDrop(lines)
 			return
 		}
 
 		req, err := http.NewRequestWithContext(s.ctx, http.MethodPost, s.cfg.IngestURL, bytes.NewReader(shipPayload))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "monitor: failed to create request: %v\n", err)
+			fmt.Fprintf(stderrWriter, "monitor: failed to create request: %v\n", err)
+			s.recordDrop(lines)
 			return
 		}
 
@@ -285,12 +328,14 @@ func (s *shipper) shipBatch(batch []Event) {
 		resp, err := s.client.Do(req)
 		if err != nil {
 			// Network error (or context cancellation) — retry unless cancelled.
-			fmt.Fprintf(os.Stderr, "monitor: failed to ship events: %v\n", err)
+			fmt.Fprintf(stderrWriter, "monitor: failed to ship events: %v\n", err)
 			if s.ctx.Err() != nil {
+				s.recordDrop(lines)
 				return
 			}
 			if attempt == maxRetries {
-				fmt.Fprintf(os.Stderr, "monitor: dropping batch after %d retries\n", maxRetries)
+				fmt.Fprintf(stderrWriter, "monitor: dropping batch after %d retries\n", maxRetries)
+				s.recordDrop(lines)
 				return
 			}
 			continue
@@ -301,19 +346,24 @@ func (s *shipper) shipBatch(batch []Event) {
 		resp.Body.Close()
 
 		if resp.StatusCode < 400 {
+			s.flushed.Add(lines)
 			return // Success
 		}
 
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			// Client error — don't retry
-			fmt.Fprintf(os.Stderr, "monitor: ingest returned status %d, not retrying\n", resp.StatusCode)
+			// Client error — don't retry. This is where a wrong or expired API
+			// key lands, so it must count as loss: a Dropped that stayed at 0
+			// through a 401 storm would be the most misleading number in the SDK.
+			fmt.Fprintf(stderrWriter, "monitor: ingest returned status %d, not retrying\n", resp.StatusCode)
+			s.recordDrop(lines)
 			return
 		}
 
 		// 5xx — retry
-		fmt.Fprintf(os.Stderr, "monitor: ingest returned status %d\n", resp.StatusCode)
+		fmt.Fprintf(stderrWriter, "monitor: ingest returned status %d\n", resp.StatusCode)
 		if attempt == maxRetries {
-			fmt.Fprintf(os.Stderr, "monitor: dropping batch after %d retries\n", maxRetries)
+			fmt.Fprintf(stderrWriter, "monitor: dropping batch after %d retries\n", maxRetries)
+			s.recordDrop(lines)
 			return
 		}
 	}

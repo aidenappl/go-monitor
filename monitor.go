@@ -17,6 +17,12 @@ import (
 // It defaults to os.Stdout and is only overridden in tests.
 var stdoutWriter io.Writer = os.Stdout
 
+// stderrWriter is the destination for the SDK's own diagnostics — dropped
+// events, ship failures, the zone assertion. It defaults to os.Stderr and is
+// only overridden in tests. Routing them through one variable is what lets a
+// test assert that the SDK complained, instead of trusting that it did.
+var stderrWriter io.Writer = os.Stderr
+
 // Config holds the configuration for the monitor.
 type Config struct {
 	// Service is the name of the service emitting events. Required.
@@ -34,7 +40,26 @@ type Config struct {
 	IngestURL string
 
 	// APIKey is an optional API key for authenticating with the ingest endpoint.
+	// It must be minted ON the zone IngestURL points at: the server derives the
+	// project (and therefore the tenant) from the api_keys row behind this key,
+	// so a key from another zone or from the control plane files this service's
+	// events under someone else's project without erroring anywhere.
 	APIKey string
+
+	// Zone is the Monitor zone this service expects to be reporting into
+	// (e.g. "trailblaze", "appleby"). Optional; empty disables the check.
+	//
+	// It is NEVER sent on the wire. Tenancy is stamped server-side and a client
+	// cannot influence it — this is purely a startup assertion. At Init the SDK
+	// asks the ingest origin's /health which zone it actually is and complains
+	// loudly if the answer disagrees, because a service pointed at the wrong
+	// zone otherwise reports there silently and permanently, and misattributed
+	// telemetry cannot be unmixed after the fact.
+	Zone string
+
+	// DisableZoneVerify skips the Init-time zone assertion even when Zone is set.
+	// Default: false (the check is on whenever Zone is set).
+	DisableZoneVerify bool
 
 	// BatchSize is the maximum number of events per batch. Default: 200.
 	BatchSize int
@@ -54,6 +79,19 @@ type Config struct {
 	// CaptureSource enables automatic source location capture. Default: true.
 	// Set to false to disable adding source_file, source_line, source_func to events.
 	CaptureSource *bool
+
+	// OnDrop is invoked with the shipper's running drop total every time events
+	// are lost (full buffer, unserializable event, or a batch abandoned after
+	// retries / rejected with a 4xx). Optional.
+	//
+	// It exists so loss is visible to something other than stderr — the one
+	// place nobody watches on the service whose telemetry just stopped arriving.
+	//
+	// Called synchronously on the goroutine that hit the drop, which for a full
+	// buffer is the caller of Emit: bump a counter, do not do I/O or take a lock
+	// that anything slow holds, or you have made Emit block — the thing this SDK
+	// promises never to do. A panic here is recovered and logged.
+	OnDrop func(total int64)
 }
 
 // globalConfig stores the initialized configuration atomically.
@@ -101,6 +139,13 @@ func Init(cfg Config) error {
 		s.start()
 	} else {
 		globalShipper.Store(nil)
+	}
+
+	// Assert the zone last and off this goroutine: the shipper is already up, so
+	// a slow or unreachable /health can neither delay the service's startup nor
+	// hold back a single event.
+	if cfg.Zone != "" && cfg.IngestURL != "" && !cfg.DisableZoneVerify {
+		startZoneVerification(&cfg)
 	}
 
 	return nil
@@ -228,12 +273,12 @@ func dispatchEvent(event Event) {
 	if !cfg.DisableStdout {
 		jsonBytes, err := event.ToJSON()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "monitor: failed to marshal event: %v\n", err)
+			fmt.Fprintf(stderrWriter, "monitor: failed to marshal event: %v\n", err)
 			return
 		}
 		// Write the NDJSON line (payload + trailing newline) in a single Write.
 		if _, err := stdoutWriter.Write(append(jsonBytes, '\n')); err != nil {
-			fmt.Fprintf(os.Stderr, "monitor: failed to write event to stdout: %v\n", err)
+			fmt.Fprintf(stderrWriter, "monitor: failed to write event to stdout: %v\n", err)
 		}
 	}
 	if s := globalShipper.Load(); s != nil {
