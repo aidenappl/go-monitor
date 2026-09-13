@@ -3,40 +3,52 @@
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                       Application                            │
-├─────────────────────────────────────────────────────────────┤
-│  Middleware     →    Context      →    Emit()               │
-│  (IDs injected)      (IDs stored)      (Event created)      │
-├─────────────────────────────────────────────────────────────┤
-│                         Event                                │
-│  ┌─────────────┐    ┌─────────────┐                         │
-│  │   stdout    │    │   shipper   │ → HTTP POST (gzip)      │
-│  │  (NDJSON)   │    │  (batched)  │                         │
-│  └─────────────┘    └─────────────┘                         │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ Application                                                           │
+│   Middleware → Context → Emit()/slog/CaptureErrorAs/Go (panics)       │
+├──────────────────────────────────────────────────────────────────────┤
+│ dispatchEvent                                                         │
+│   sanitize (ids, level, sizes) → redact → Recorder | stdout + shipper │
+├──────────────────────────────────────────────────────────────────────┤
+│ shipper                                                               │
+│   run(): eventsCh → batches (never does I/O)                          │
+│   memory mode:  shipLoop → POST (retry 3×) ─────────────┐             │
+│   spool mode:   writeLoop → disk segments → drainLoop → POST (forever)│
+│   rejected request → bisect → quarantine the bad line   │             │
+└─────────────────────────────────────────────────────────┴─ Monitor ──┘
 ```
 
 ## Core Components
 
-| File            | Purpose                                      |
-| --------------- | -------------------------------------------- |
-| `monitor.go`    | Initialization, config, `Emit()` entry point |
-| `event.go`      | Event struct and JSON serialization          |
-| `context.go`    | Context key storage for IDs                  |
-| `middleware.go` | HTTP middleware for ID injection             |
-| `shipper.go`    | Async batching and HTTP shipping             |
-| `zone.go`       | Startup zone assertion against `/health`     |
-| `stats.go`      | `Stats()` / `ShipperStats` loss counters     |
-| `ids.go`        | UUID v4 generation                           |
+| File              | Purpose |
+| ----------------- | ------- |
+| `monitor.go`      | `Init`, `Config`, `Emit`, `dispatchEvent`, global state |
+| `event.go`        | `Event` struct and JSON serialization |
+| `validate.go`     | Event sanitization, oversize shrinking, throttled diagnostics |
+| `redact.go`       | Credential scrubbing by key and by value shape |
+| `shipper.go`      | Batching, status classification, retry policies, bisection |
+| `spool.go`        | Durable on-disk queue |
+| `platform_*.go`   | Advisory lock and free-disk measurement (build-tagged) |
+| `zone.go`         | Startup zone assertion against `/health` |
+| `stats.go`        | `Stats()` / `ShipperStats` |
+| `recorder.go`     | In-memory event capture for tests |
+| `safego.go`       | Goroutine panic reporting |
+| `slog.go`         | `log/slog` handler that tees into Monitor |
+| `middleware.go`   | HTTP id propagation and `http.request` events |
+| `client.go`       | Outbound id propagation and `http.client_request` events |
+| `context.go`      | Context key storage for ids |
+| `ids.go`          | Id generation and the monitor-core id rule |
 
 ## Data Flow
 
-1. **Init** – `Init(Config)` stores config atomically, starts shipper if `IngestURL` set,
-   then starts the zone check (own goroutine) if `Zone` is set
-2. **Middleware** – Extracts/generates `request_id` and `trace_id`, stores in context
-3. **Emit** – Creates `Event` from context + config, writes to stdout and/or shipper
-4. **Shipper** – Buffers events, flushes on interval or batch size, POSTs as NDJSON
+1. **Init** – stores config and redactor atomically; replaces an invalid `JobID`; opens the
+   spool (falling back to memory if it cannot); starts the shipper; starts the zone check.
+   Never touches the network synchronously, never fails on it.
+2. **Middleware** – takes valid inbound `X-Request-Id`/`X-Trace-Id` or mints new ones.
+3. **Emit** – builds the event from context + config, attaches the source location.
+4. **dispatchEvent** – sanitizes and redacts, then records it (test) or prints and ships it.
+5. **Shipper** – batches; memory mode POSTs directly, spool mode writes to disk and a single
+   drain POSTs oldest-first.
 
 ## Tenancy
 
@@ -44,36 +56,31 @@ The event carries **no `project` and no `zone` field**, by design. `monitor-core
 `project` from the `api_keys` row behind the credential and overwrites whatever a client
 sends — that overwrite is the tenancy boundary, and a wire field would undermine it.
 
-A process therefore selects a zone with two config values, and `globalShipper` is a
-single `atomic.Pointer`, so a process ships to exactly one of them:
-
-| Config      | Role                                                              |
-| ----------- | ----------------------------------------------------------------- |
-| `IngestURL` | That zone's registered ingest endpoint                            |
-| `APIKey`    | A key **minted on that zone** — this is what decides the project  |
-| `Zone`      | The expected zone slug; asserted at `Init`, never transmitted     |
+| Config      | Role |
+| ----------- | ---- |
+| `IngestURL` | That zone's registered ingest endpoint |
+| `APIKey`    | A key **minted on that zone** — this is what decides the project |
+| `Zone`      | The expected zone slug; asserted at `Init`, never transmitted |
 
 ## Zone Verification
 
 - **Trigger**: `Init`, when `Zone` and `IngestURL` are set and `DisableZoneVerify` is false
 - **Probe**: one `GET {scheme}://{host}/health` built from the ingest URL's **origin**
-  (`IngestURL` is the full `.../v1/events` endpoint, so the path is stripped, not appended)
-- **Bounds**: own goroutine, 3s client timeout, 64 KiB body cap — `Init` never waits and
-  never fails on it
-- **Outcomes**: `matched` (silent) · `mismatched` (loud banner) · `unverified`, i.e. 200
-  with no `zone` key (quiet) · `unreachable` (quiet)
+- **Bounds**: own goroutine, 3s client timeout, 64 KiB body cap
+- **Outcomes**: `matched` (silent) · `mismatched` (loud banner) · `unverified` (quiet) ·
+  `unreachable` (quiet)
 
 ## Event Schema
 
 ```json
 {
-  "timestamp": "2026-02-06T12:00:00.000Z",
+  "timestamp": "2026-09-12T12:00:00.000Z",
   "service": "my-service",
   "env": "prod",
-  "job_id": "abc123",
-  "request_id": "def456",
-  "trace_id": "ghi789",
-  "user_id": "user-1",
+  "job_id": "3f9a1c07b2e84d51",
+  "request_id": "a07c5e19d3b2f648",
+  "trace_id": "01234567-89ab-4cde-8f01-23456789abcd",
+  "user_id": "12345",
   "name": "event.name",
   "level": "info",
   "data": {}
@@ -82,70 +89,74 @@ single `atomic.Pointer`, so a process ships to exactly one of them:
 
 ## ID Hierarchy
 
-| ID           | Scope             | Source                             |
-| ------------ | ----------------- | ---------------------------------- |
-| `job_id`     | Process lifetime  | Config or auto-generated           |
-| `trace_id`   | Distributed trace | `X-Trace-Id` header or generated   |
-| `request_id` | Single request    | `X-Request-Id` header or generated |
-| `user_id`    | User context      | Set via `WithUserID(ctx, id)`      |
+| ID           | Scope             | Source |
+| ------------ | ----------------- | ------ |
+| `job_id`     | Process, or a job | Config (validated) / auto; `WithJobID(ctx, NewJobID())` per job |
+| `trace_id`   | Distributed trace | Valid `X-Trace-Id` header, or `NewTraceID()` |
+| `request_id` | Single request    | Valid `X-Request-Id` header, or `NewRequestID()` |
+| `user_id`    | User context      | `WithUserID(ctx, id)` — free text, not validated by the server |
+
+Every id must match monitor-core's `^(UUID|[0-9a-fA-F]{8,64})$` or it is cleared at emit.
 
 ## Shipper Behavior
 
-- **Buffer**: Buffered channel, capacity = `BatchSize * 2`, drained by the
-  accumulator goroutine into an in-memory batch slice
-- **Flush triggers**: Timer (`FlushEvery`), batch full, or explicit `Flush()`
-- **Concurrency**: An accumulator goroutine drains the channel and never blocks
-  on network I/O; a single dedicated flush-worker goroutine performs the ordered
-  HTTP POSTs, so retries don't stall event intake
-- **Transport**: HTTP POST with optional gzip, `X-Api-Key` header
-- **Failure handling**: Logs to stderr; retries up to 3× on 5xx/network errors
-  with exponential backoff (1s/2s/4s); drops on 4xx. Retries and in-flight
-  requests are bound to a context that is cancelled on `Shutdown` (bounded by a
-  short shutdown timeout)
-- **Loss accounting**: every path that abandons events (full buffer, marshal
-  failure, gzip failure, retries exhausted, 4xx, cancelled shutdown) calls
-  `recordDrop`, which bumps the atomic counter and invokes `Config.OnDrop` with the
-  running total — nil-guarded and `recover()`ed, so a broken callback can't take
-  down the shipper. `Stats()` exposes `Enqueued`/`Dropped`/`Flushed`
+- **Buffer**: channel of `BatchSize*2`; full → counted drop. `Emit` never blocks.
+- **Flush triggers**: batch full, `FlushEvery`, `Flush()`, shutdown. A `Flush` first drains
+  what is already buffered, so an event emitted before it always ships with it.
+- **Request limits**: ≤ 8 MiB uncompressed per request, ≤ 1,000,000 bytes per line
+  (oversized events are shrunk to their grouping fields).
+- **Classification**: `<400` delivered · content `4xx` rejected · `401/403/404/405`
+  misconfigured · `408/429/5xx`/network retryable. `Retry-After` honoured.
+- **Bisection**: a rejected request is split and resent until the bad line stands alone,
+  within `4·⌈log₂ n⌉+4` extra requests; the isolated line is quarantined.
+- **Memory policy**: 3 retries (1s/2s/4s); misconfigured and exhausted batches are dropped.
+- **Spool policy**: retries forever with full-jitter backoff up to `MaxBackoff`;
+  misconfigured batches are held.
+- **Loss accounting**: every abandoning path calls `recordDrop` → counter + `OnDrop`.
+
+## Spool
+
+- **Layout** (`<SpoolDir>/<Service>/`): `LOCK`, `seg-<seq>.ndjson` segments, `cursor`,
+  `poison.ndjson`.
+- **Write path** (`writeLoop`, one goroutine): lines placed one at a time; segments sealed at
+  4 MiB (≤ a quarter of the cap) or when the drain asks; fsync every `SpoolSyncEvery`.
+- **Limits**: bytes, 256 files, free-disk floor. Eviction removes the oldest sealed
+  segment, never the one being drained.
+- **Drain** (`drainLoop`, one goroutine): startup jitter, rate-limited to `DrainRate`,
+  oldest segment first, cursor persisted with write-then-rename after every request.
+- **Recovery**: torn final line trimmed; resume at the cursor. At-least-once — a crash
+  re-sends at most one batch.
 
 ## Thread Safety
 
-- `globalConfig` and `globalShipper` use `atomic.Pointer`
-- Shipper uses channels for the event queue and the batch handoff; the batch slice is
-  owned by the accumulator goroutine alone, and `stop()` is guarded by a `sync.Once`
-- Shipper counters are `atomic.Int64` — `send()` runs on every caller's goroutine while
-  `shipLoop()` runs on its own
-- Context operations are inherently safe
+- `globalConfig`, `globalShipper`, `globalRedactor`, and the active `Recorder` are
+  `atomic.Pointer`s.
+- The batch slice belongs to `run()` alone; the active segment file belongs to
+  `writeLoop()` alone. Segment bookkeeping shared with the drain is guarded by `spool.mu`;
+  pending counts are atomic.
+- Counters are `atomic.Int64`. `stop()` is guarded by a `sync.Once`.
 
 ## Usage Patterns
 
-**Standalone script:**
-
-```go
-monitor.Init(monitor.Config{Service: "script"})
-monitor.Emit(ctx, "job.done", nil)
-monitor.Shutdown()
-```
-
-**HTTP service:**
+**HTTP service that must not lose events:**
 
 ```go
 monitor.Init(monitor.Config{
-    Service:   "api",
-    Zone:      "trailblaze",
-    IngestURL: "https://api.monitor.appleby.cloud/v1/events",
-    APIKey:    os.Getenv("MONITOR_API_KEY"), // minted on the trailblaze zone
+    Service:       "api",
+    Zone:          "appleby",
+    IngestURL:     "https://appleby-monitor-api.appleby.cloud/v1/events",
+    APIKey:        os.Getenv("MONITOR_API_KEY"), // minted on the appleby zone
+    SpoolDir:      "/var/lib/api/monitor-spool",
+    DisableStdout: true,
 })
-r.Use(monitor.Middleware)
-// IDs auto-propagate through r.Context()
+defer monitor.Shutdown()
 ```
 
-Note `https://monitor.appleby.cloud` is the dashboard's web origin, not an ingest
-endpoint. The `appleby` zone ingests at `https://appleby-monitor-api.appleby.cloud/v1/events`.
-
-**Manual ID injection:**
+**Daemon job correlation:**
 
 ```go
-ctx = monitor.WithUserID(ctx, "user-123")
-ctx = monitor.WithTraceID(ctx, parentTraceID)
+ctx := monitor.WithJobID(ctx, monitor.NewJobID())
+monitor.Go(ctx, "deploy-worker", runDeploy)
 ```
+
+Note `https://monitor.appleby.cloud` is the dashboard's web origin, not an ingest endpoint.
