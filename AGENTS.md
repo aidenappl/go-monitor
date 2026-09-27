@@ -174,7 +174,12 @@ from a proxy is the usual source); an empty name becomes `event.unnamed`; level 
 the server would store verbatim and never group into an issue are folded; `name`/`path`
 are bounded to the issue table's column widths. `marshalLine` enforces the 1 MB line
 limit by replacing an oversized event's data with its grouping fields (truncated) plus
-`truncated`/`original_size_bytes`, so it still groups with its siblings.
+`truncated`/`original_size_bytes`, so it still groups with its siblings. monitor-core's
+issue fingerprint is `sha256(project|service|name|path|normalize(message))`: `path` is
+`data.path`, else `data.uri`; `message` is the first of `data.error`, `data.error_message`,
+`data.message`, else the event name (with `data.method` and the path prefixed when both a
+path and an error are present). `status_code`, `reason` and `source_*` are kept on a shrunk
+event for context but are **not** part of the fingerprint.
 
 ### Redaction (redact.go)
 
