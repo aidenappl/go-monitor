@@ -28,12 +28,22 @@ const (
 	maxPathChars = 1000
 )
 
-// groupingKeys are the data keys monitor-core's issue fingerprint reads. When an
-// event has to be shrunk these survive (truncated), so it still groups with its
-// siblings instead of forming an issue of its own.
+// groupingKeys are the data keys monitor-core's issue fingerprint reads. The
+// fingerprint is sha256(project|service|name|path|normalize(message)), where
+// path is data.path, else data.uri, and message is the first of data.error,
+// data.error_message, data.message, else the event name (prefixed with
+// data.method and the path when both a path and an error string are present).
+// When an event has to be shrunk these survive (truncated), so it still groups
+// with its siblings instead of forming an issue of its own.
 var groupingKeys = []string{
-	"error", "error_message", "message", "path", "uri", "method", "reason",
-	"status_code", "source_file", "source_func", "source_line",
+	"error", "error_message", "message", "path", "uri", "method",
+}
+
+// contextKeys are not part of the fingerprint, but a shrunk event keeps them
+// (truncated) as well: without the status and call site an oversized error is
+// grouped correctly yet tells nobody where it came from.
+var contextKeys = []string{
+	"reason", "status_code", "source_file", "source_func", "source_line",
 }
 
 // sanitizeEvent makes e safe to batch. Every check here exists because
@@ -151,15 +161,15 @@ func marshalLine(e Event) ([]byte, error) {
 	return shrunk, nil
 }
 
-// shrinkEvent replaces an oversized event's data with its grouping fields,
-// truncated, plus markers saying what happened.
+// shrinkEvent replaces an oversized event's data with its grouping and context
+// fields, truncated, plus markers saying what happened.
 func shrinkEvent(e Event, size int) Event {
 	kept := map[string]any{
 		"truncated":           true,
 		"original_size_bytes": size,
 	}
 	if m, ok := e.Data.(map[string]any); ok {
-		for _, k := range groupingKeys {
+		for _, k := range append(append([]string{}, groupingKeys...), contextKeys...) {
 			switch v := m[k].(type) {
 			case string:
 				kept[k] = truncateString(v, maxFieldChars)

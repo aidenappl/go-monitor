@@ -174,7 +174,8 @@ monitor.CaptureErrorAs(ctx, "secret.decrypt.failed", err, map[string]any{"secret
 ```
 
 Monitor groups `error` and `fatal` events into issues by service, event name,
-`data.path`, and message (`data.error`, then `data.error_message`, then `data.message`).
+`data.path` (else `data.uri`), and message (`data.error`, then `data.error_message`, then
+`data.message`, else the event name). `status_code` and `source_*` do not affect grouping.
 Put the operation in the name and the route pattern in `data.path`.
 
 #### Inspecting emit options
