@@ -14,7 +14,10 @@ env:
 jobs:
   check:
     name: Check
-    runs-on: [self-hosted, lattice-worker]
+    # GitHub-hosted on purpose: this suite has timing guards (fsync latency,
+    # sub-50ms parse budgets) that the self-hosted CI host's HDD RAID and
+    # older CPUs cannot meet. Everything else in this repo runs self-hosted.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
