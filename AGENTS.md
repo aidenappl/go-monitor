@@ -24,7 +24,7 @@ async batching shipper, HTTP middleware, and an outbound-HTTP transport wrapper.
 
 ## 2. Stack & dependencies
 
-- Go 1.25 (`go.mod` — `go 1.25.5`).
+- Go 1.26 (`go.mod` — `go 1.25.5`).
 - **Zero dependencies** — standard library only; `go.mod` has no `require`. IDs come from
   `crypto/rand`. The spool's advisory lock and free-disk check use `syscall` behind build
   tags: `platform_unix.go` (linux, darwin) and `platform_other.go` (everything else).
@@ -73,7 +73,7 @@ go-monitor/
 
 ## 4. Running, building & testing
 
-Uses the `dev` CLI (`Devfile.yaml`). Prerequisite: Go 1.25.
+Uses the `dev` CLI (`Devfile.yaml`). Prerequisite: Go 1.26.
 
 ```bash
 dev build     # go build -o bin/app .
