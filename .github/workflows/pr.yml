@@ -14,6 +14,9 @@ env:
 jobs:
   check:
     name: Check
+    # GitHub-hosted on purpose: this suite has timing guards (fsync latency,
+    # sub-50ms parse budgets) that the self-hosted CI host's HDD RAID and
+    # older CPUs cannot meet. Everything else in this repo runs self-hosted.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +25,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          cache: false
 
       - name: Check formatting
         run: test -z "$(gofmt -l .)" || (gofmt -d . && exit 1)
